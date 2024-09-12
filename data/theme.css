@@ -1,0 +1,63 @@
+/*
+.list-store * {
+  all: unset;
+}
+*/
+
+row {
+  border: 0px;
+  margin: -2px;
+}
+
+.layer-item {
+  background-color: rgb(200,220,250);
+  transition:
+    border-color 0.3s ease-in-out,
+    background-color 0.05s ease-in,
+    background-color 0.1s ease-out,
+    box-shadow 0.4s ease-in,
+    box-shadow 0.2s ease-out;
+  padding-top: 4px;
+  padding-bottom: 4px;
+  border-top: 1px solid rgba(0, 191, 255, 0);
+  border-bottom: 1px solid rgba(0, 191, 255, 0);
+  margin-top: -1px;
+  margin-bottom: -1px;
+}
+
+.cursor {
+  background-color: rgb(82, 227, 104);
+  font-size: 6pt;
+}
+
+/* Add "drop here" areas when a drag has been initiated */
+.dragging-item .layer-item {
+  border-color: rgba(0, 191, 255, 0.2);
+}
+
+/* Style when dragged over */
+.drag-over.layer-item {
+  background-color: rgb(219, 233, 255);
+}
+
+/* Style when dragged over the top part */
+.drag-top.layer-item {
+  border-top: 2px solid rgb(0, 191, 255);
+  margin-top: -2px;
+  box-shadow:
+    0 -1px 6px 1px rgba(94, 234, 255, 0.5),
+    inset 0 8px 6px -6px rgba(94, 234, 255, 0.5);
+}
+
+/* Style when dragged over the bottom part */
+.drag-bot.layer-item {
+  border-bottom: 2px solid rgb(0, 191, 255);
+  margin-bottom: -2px;
+  box-shadow:
+    inset 0 -8px 6px -6px rgba(94, 234, 255, 0.5);
+}
+
+/* Style for item being dragged */
+.dragged.layer-item {
+  background-color: grey;
+}

@@ -1,0 +1,63 @@
+cabal-version:      3.0
+name:               gtk-layers
+version:            0.0.0.1
+license:            BSD-3-Clause
+author:             sheaf
+maintainer:         sheaf
+homepage:           https://github.com/sheaf/gtk-layers
+category:           UI
+build-type:         Simple
+data-dir:
+  data
+data-files:
+  theme.css
+extra-doc-files:
+  readme.md
+  changelog.md
+
+description:
+  Illustration of the TreeListModel and ListView functionality in GTK4,
+  used to create a UI of layers with groups.
+
+executable gtk-layers
+
+  hs-source-dirs:
+      .
+
+  main-is:
+      Main.hs
+  autogen-modules:
+      Paths_gtk_layers
+  other-modules:
+      Paths_gtk_layers
+
+  build-depends:
+      base
+    , containers
+    , directory
+    , haskell-gi-base, gi-gdk, gi-gtk, gi-gio, gi-gobject
+    , stm
+    , text
+    , transformers
+
+  pkgconfig-depends:
+      -- gtk-layers needs GTK 4 API version 4.10 or above
+      gtk4 >= 4.10
+
+  default-language:
+      Haskell2010
+  default-extensions:
+      BangPatterns
+      DataKinds
+      DerivingStrategies
+      GeneralizedNewtypeDeriving
+      ImplicitParams
+      LambdaCase
+      NamedFieldPuns
+      OverloadedStrings
+      TypeApplications
+      TypeFamilies
+      ViewPatterns
+
+  ghc-options:
+      -Wall
