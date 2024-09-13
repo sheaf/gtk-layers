@@ -10,12 +10,26 @@ import Data.Foldable
   ( for_ )
 import Data.Int
   ( Int64 )
+import Data.IORef
+  ( IORef, newIORef, readIORef, writeIORef )
 import Data.Word
   ( Word64 )
+import Foreign
+  ( FunPtr, malloc, free )
+import Foreign.C
+  ( CString, CSize(..) )
+import Foreign.Ptr
+  ( Ptr, castPtr )
+import Foreign.Storable
+  ( Storable(..) )
 import GHC.Stack
   ( HasCallStack )
+import System.Environment
+  ( setEnv )
 import System.Exit
   ( ExitCode(..), exitWith, exitSuccess )
+import System.IO.Unsafe
+  ( unsafePerformIO )
 
 -- containers
 import Data.Map.Strict
@@ -37,6 +51,7 @@ import qualified Data.GI.Base as GI
 import qualified Data.GI.Base.GObject as GI
 import qualified Data.GI.Base.GType as GI
 import qualified Data.GI.Base.Overloading as GI
+import qualified Data.GI.Base.Utils as GI
 
 -- gi-gdk
 import qualified GI.Gdk as GDK
@@ -219,12 +234,11 @@ newLayerView window uniqueTVar historyTVar layersContentDebugLabel layersListMod
 
         listItem <- GTK.unsafeCastTo GTK.ListItem listItem0
         setupNewLayerViewWidget listItem
+
         LayerViewWidget
           { layerViewExpander = expander
           , layerViewLabel = label }
             <- getLayerViewWidget listItem
-
-        return ()
 
         -- Connect a signal for editing the layer name.
         void $ GTK.onEditableChanged label $ do
@@ -248,16 +262,16 @@ newLayerView window uniqueTVar historyTVar layersContentDebugLabel layersListMod
           GTK.labelSetText layersContentDebugLabel newDebugText
 
 
-
         -- Connect signals for starting a drag from this widget.
         dragSource <- GTK.dragSourceNew
 
         void $ GTK.onDragSourcePrepare dragSource $ \ _x _y -> do
           ( _, layerItem ) <- treeListItemLayerItem listItem
           dat <- getLayerData layerItem
-          let mbDragSourceUnique = layerUnique_maybe dat
-          val <- GDK.contentProviderNewForValue =<< GIO.toGValue mbDragSourceUnique
-          GTK.widgetAddCssClass window "dragging-item"
+          let dragSourceData = layerDragSource dat
+          gval <- GIO.toGValue @DragSourceData dragSourceData
+          val <- GDK.contentProviderNewForValue gval
+          --GTK.widgetAddCssClass window "dragging-item"
           return $ Just val
         void $ GTK.onDragSourceDragBegin dragSource $ \ _drag -> do
           paintable <- GTK.widgetPaintableNew ( Just expander )
@@ -275,10 +289,13 @@ newLayerView window uniqueTVar historyTVar layersContentDebugLabel layersListMod
           mbSurf <- GDK.dragGetDragSurface drag
           for_ mbSurf $ GDK.surfaceDestroy
 
-        -- Connect signals for receiving a drop on this widget.
-        dropTarget <- GTK.dropTargetNew GI.gtypeInt64 [ GDK.DragActionCopy ]
 
-        let dropTargetCleanup = do
+        -- Connect signals for receiving a drop on this widget.
+        dragSourceDataGType <- readIORef dragSourceGTypeRef
+        dropTarget <- GTK.dropTargetNew dragSourceDataGType [ GDK.DragActionCopy ]
+
+        let dropTargetCleanup :: IO ()
+            dropTargetCleanup = do
               GTK.widgetRemoveCssClass expander "drag-over"
               GTK.widgetRemoveCssClass expander "drag-top"
               GTK.widgetRemoveCssClass expander "drag-bot"
@@ -293,12 +310,11 @@ newLayerView window uniqueTVar historyTVar layersContentDebugLabel layersListMod
             Cursor -> return False
             _      -> return True
         void $ GTK.onDropTargetDrop dropTarget $ \ val _x y -> do
-
           ( _, layerItem ) <- treeListItemLayerItem listItem
           dat <- getLayerData layerItem
-          let mbDropTargetUnique = layerUnique_maybe dat
-          mbDragSourceUnique <- GIO.fromGValue val
-          if mbDropTargetUnique == mbDragSourceUnique
+          let dropTargetData = layerDragSource dat
+          dragSourceData <- GIO.fromGValue @DragSourceData val
+          if dragSourceData == dropTargetData
           then return False -- Don't allow a drag onto ourselves.
           else do
             h <- GTK.widgetGetHeight expander
@@ -312,25 +328,24 @@ newLayerView window uniqueTVar historyTVar layersContentDebugLabel layersListMod
 
             putStrLn $ unlines
               [ "DND"
-              , "source: " ++ show mbDragSourceUnique
-              , "target: " ++ show mbDropTargetUnique
+              , "source: " ++ show dragSourceData
+              , "target: " ++ show dropTargetData
               , "droppedAbove: " ++ show droppedAbove
               , "expanded:" ++ show expanded
               ]
 
             History { present = ( newLayers, newMetaData ) } <- STM.atomically $ do
               hist@History { past, present = ( content@Content { contentLayers = layers }, meta ) } <- STM.readTVar historyTVar
-              let layers' = dragAndDropLayerUpdate mbDragSourceUnique mbDropTargetUnique droppedAbove expanded layers
+              let layers' = dragAndDropLayerUpdate dragSourceData dropTargetData droppedAbove expanded layers
                   content' = content { contentLayers = layers' }
                   hist' = History { past = past Seq.:|> content, present = ( content', meta ), future = [] }
               STM.writeTVar historyTVar hist'
               return hist
-            dragAndDropListModelUpdate mbDragSourceUnique mbDropTargetUnique droppedAbove expanded layersListModel
+            dragAndDropListModelUpdate dragSourceData dropTargetData droppedAbove expanded layersListModel
             let newDebugText = Text.intercalate "\n" $ prettyLayers $ layerDataForUI newMetaData ( contentLayers newLayers )
             GTK.labelSetText layersContentDebugLabel newDebugText
 
             return True
-
         GTK.widgetAddCssClass expander "layer-item"
         void $ GTK.onDropTargetEnter dropTarget $ \ _x y -> do
           GTK.widgetAddCssClass expander "drag-over"
@@ -426,6 +441,8 @@ getNextItem_maybe expander = do
 
 main :: IO ()
 main = do
+  --setEnv "GTK_DEBUG" "actions,tree"
+  --setEnv "GDK_DEBUG" "dnd"
   application <- GTK.applicationNew ( Just "com.layers" ) [ ]
   GIO.applicationRegister application ( Nothing @GIO.Cancellable )
   void $ GIO.onApplicationActivate application ( runApplication application )
@@ -449,6 +466,8 @@ runApplication application = do
   GTK.styleContextAddProviderForDisplay display cssProvider 1000
 
   GTK.widgetAddCssClass window "list-store"
+
+  newDragSourceDataGType
 
   contentBox <- GTK.boxNew GTK.OrientationHorizontal 100
   layersBox  <- GTK.boxNew GTK.OrientationVertical 0
@@ -490,7 +509,7 @@ runApplication application = do
 --------------
 
 newtype Unique = Unique { unique :: Word64 }
-  deriving newtype ( Eq, Ord, Enum, GTK.IsGValue )
+  deriving newtype ( Eq, Ord, Enum )
 instance Show Unique where { show ( Unique i ) = "%" ++ show i }
 
 -- | Application-side representation of a layer.
@@ -525,6 +544,78 @@ data History
 -- GTK UI data --
 -----------------
 
+--type DragSourceData = Int64
+
+data DragSourceData = CursorDrag | LayerDrag !Unique
+  deriving stock ( Eq, Ord, Show )
+
+instance Storable DragSourceData where
+  sizeOf _ = sizeOf @Int64 undefined
+  alignment _ = alignment @Int64 undefined
+  peek ptr = do
+    v <- peek @Int64 ( castPtr ptr )
+    if v == -1
+    then return CursorDrag
+    else return $ LayerDrag $ Unique $ fromIntegral v
+  poke ptr dat = do
+    let val :: Int64
+        val = case dat of
+          CursorDrag -> -1
+          LayerDrag ( Unique u ) -> fromIntegral u
+    poke @Int64 ( castPtr ptr ) val
+
+
+dragSourceGTypeRef :: IORef GI.GType
+dragSourceGTypeRef = unsafePerformIO $ newIORef undefined
+{-# NOINLINE dragSourceGTypeRef #-}
+
+type BoxedCopyFunc a = Ptr a -> IO ( Ptr a )
+type BoxedFreeFunc a = Ptr a -> IO ()
+
+foreign import ccall "g_boxed_type_register_static"
+  g_boxed_type_register_static ::
+    CString ->
+    FunPtr ( BoxedCopyFunc a ) ->
+    FunPtr ( BoxedFreeFunc a ) ->
+    IO GI.CGType
+foreign import ccall "wrapper" mk_BoxedCopyFunc :: BoxedCopyFunc a -> IO ( FunPtr ( BoxedCopyFunc a ) )
+foreign import ccall "wrapper" mk_BoxedFreeFunc :: BoxedFreeFunc a -> IO ( FunPtr ( BoxedFreeFunc a ) )
+
+foreign import ccall unsafe "memcpy"
+   memcpy :: Ptr a -> Ptr a -> CSize -> IO ()
+
+boxedTypeRegisterStatic :: Text -- ^ /@name@/: Name of the new boxed type.
+                        -> BoxedCopyFunc a -- ^ /@boxedCopy@/: Boxed structure copy function.
+                        -> BoxedFreeFunc a -- ^ /@boxedFree@/: Boxed structure free function.
+                        -> IO GI.GType
+boxedTypeRegisterStatic name boxedCopy boxedFree = do
+    name' <- GTK.textToCString name
+    boxedCopy' <- mk_BoxedCopyFunc boxedCopy
+    boxedFree' <- mk_BoxedFreeFunc boxedFree
+    result <- g_boxed_type_register_static name' boxedCopy' boxedFree'
+    let result' = GTK.GType result
+    GI.freeMem name'
+    return result'
+
+newDragSourceDataGType :: IO ()
+newDragSourceDataGType = do
+  dragSourceDataGType <- boxedTypeRegisterStatic "DragSourceData" copyFn freeFn
+  writeIORef dragSourceGTypeRef dragSourceDataGType
+  where
+    copyFn :: BoxedCopyFunc DragSourceData
+    copyFn ptr = do
+      ptr' <- malloc
+      memcpy ptr' ptr ( fromIntegral $ sizeOf ( undefined :: DragSourceData ) )
+      return ptr'
+    freeFn :: BoxedFreeFunc DragSourceData
+    freeFn = free
+
+
+instance GTK.IsGValue DragSourceData where
+  gvalueGType_ = readIORef dragSourceGTypeRef
+  gvalueSet_ gvalue = poke ( castPtr gvalue )
+  gvalueGet_ gvalue = peek ( castPtr gvalue )
+
 type Layers = [ Layer ]
 
 data Layer
@@ -532,10 +623,10 @@ data Layer
   | Layer { layerUnique :: !Unique, layerName :: !Text, layerVisible :: Bool }
   | Cursor
 
-layerUnique_maybe :: Layer -> Int64
-layerUnique_maybe ( Group { groupUnique } ) = fromIntegral $ unique groupUnique
-layerUnique_maybe ( Layer { layerUnique } ) = fromIntegral $ unique layerUnique
-layerUnique_maybe Cursor                    = -1
+layerDragSource :: Layer -> DragSourceData
+layerDragSource ( Group { groupUnique } ) = LayerDrag groupUnique
+layerDragSource ( Layer { layerUnique } ) = LayerDrag layerUnique
+layerDragSource Cursor                    = CursorDrag
 
 prettyLayers :: Layers -> [ Text ]
 prettyLayers = concatMap prettyLayer
@@ -548,7 +639,6 @@ prettyLayer ( Group { groupName, groupVisible, groupChildren }) =
      ++ map ( "  " <> ) ( prettyLayers groupChildren )
 
 newtype LayerItem = LayerItem ( GTK.ManagedPtr LayerItem )
-
 instance GI.TypedObject LayerItem  where
   glibType = GI.registerGType LayerItem
 
@@ -619,10 +709,10 @@ layerSpecUniques = \case
 
 -- TODO
 
-dragAndDropLayerUpdate :: Int64 -> Int64 -> Bool -> Bool -> [ LayerSpec ] -> [ LayerSpec ]
+dragAndDropLayerUpdate :: DragSourceData -> DragSourceData -> Bool -> Bool -> [ LayerSpec ] -> [ LayerSpec ]
 dragAndDropLayerUpdate dragSrc dropTgt dropAbove expanded layers = layers
 
-dragAndDropListModelUpdate :: Int64 -> Int64 -> Bool -> Bool -> GTK.TreeListModel -> IO ()
+dragAndDropListModelUpdate :: DragSourceData -> DragSourceData-> Bool -> Bool -> GTK.TreeListModel -> IO ()
 dragAndDropListModelUpdate dragSrc dropTgt dropAbove expanded layersListModel = do
   nbItems <- GIO.listModelGetNItems layersListModel
   putStrLn $ unlines
