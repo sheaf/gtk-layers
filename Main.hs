@@ -14,6 +14,8 @@ import Data.Word
   ( Word64 )
 import GHC.Stack
   ( HasCallStack )
+--import System.Environment
+--  ( setEnv )
 import System.Exit
   ( ExitCode(..), exitWith, exitSuccess )
 
@@ -150,7 +152,7 @@ data LayerViewWidget =
     { layerViewExpander    :: GTK.TreeExpander
     , layerViewContentBox  :: GTK.Box
     , layerViewCheckButton :: GTK.CheckButton
-    , layerViewLabel       :: GTK.EditableLabel
+    , layerViewLabel       :: GTK.Label
     }
 
 setupNewLayerViewWidget :: GTK.ListItem -> IO ()
@@ -169,7 +171,7 @@ setupNewLayerViewWidget listItem = do
 
   checkBox <- GTK.checkButtonNew
   GTK.boxAppend contentBox checkBox
-  itemLabel <- GTK.editableLabelNew ""
+  itemLabel <- GTK.labelNew Nothing
   GTK.boxAppend contentBox itemLabel
 
 -- | Given a 'GTK.ListItem' widget that displays a row, get the
@@ -191,7 +193,7 @@ getLayerViewWidget listItem = do
           case mbCheckButton of
             Nothing -> error "getLayerViewWidget: expected ListItem->Expander->Box->CheckButton"
             Just checkButton -> do
-              mbLayerLabel <- traverse ( GTK.unsafeCastTo GTK.EditableLabel ) =<< GTK.widgetGetNextSibling checkButton
+              mbLayerLabel <- traverse ( GTK.unsafeCastTo GTK.Label ) =<< GTK.widgetGetNextSibling checkButton
               case mbLayerLabel of
                 Nothing -> error "getLayerViewWidget: expected ListItem->Expander->Box->{CheckButton,LayerLabel}"
                 Just layerLabel ->
@@ -211,7 +213,7 @@ newLayerView :: GTK.ApplicationWindow
              -> GTK.Label
              -> GTK.TreeListModel
              -> IO GTK.ListView
-newLayerView window uniqueTVar historyTVar layersContentDebugLabel layersListModel = do
+newLayerView window _uniqueTVar historyTVar layersContentDebugLabel layersListModel = do
   layersListFactory <- GTK.signalListItemFactoryNew
 
   -- Connect to "setup" signal to create generic widgets for viewing the tree.
@@ -225,6 +227,9 @@ newLayerView window uniqueTVar historyTVar layersContentDebugLabel layersListMod
             <- getLayerViewWidget listItem
 
         return ()
+
+{- TODO: commented out because the DropTarget controllers attached
+         to editable labels cause segfaults.
 
         -- Connect a signal for editing the layer name.
         void $ GTK.onEditableChanged label $ do
@@ -246,7 +251,7 @@ newLayerView window uniqueTVar historyTVar layersContentDebugLabel layersListMod
           GI.gobjectSetPrivateData layerItem ( Just dat' )
           let newDebugText = Text.intercalate "\n" $ prettyLayers $ layerDataForUI newMetaData ( contentLayers newLayers )
           GTK.labelSetText layersContentDebugLabel newDebugText
-
+-}
 
 
         -- Connect signals for starting a drag from this widget.
@@ -255,8 +260,8 @@ newLayerView window uniqueTVar historyTVar layersContentDebugLabel layersListMod
         void $ GTK.onDragSourcePrepare dragSource $ \ _x _y -> do
           ( _, layerItem ) <- treeListItemLayerItem listItem
           dat <- getLayerData layerItem
-          let mbDragSourceUnique = layerUnique_maybe dat
-          val <- GDK.contentProviderNewForValue =<< GIO.toGValue mbDragSourceUnique
+          let mbDragSourceData = layerDragSource dat
+          val <- GDK.contentProviderNewForValue =<< GIO.toGValue mbDragSourceData
           GTK.widgetAddCssClass window "dragging-item"
           return $ Just val
         void $ GTK.onDragSourceDragBegin dragSource $ \ _drag -> do
@@ -264,16 +269,12 @@ newLayerView window uniqueTVar historyTVar layersContentDebugLabel layersListMod
           GTK.dragSourceSetIcon ?self ( Just paintable ) 0 0
           GTK.widgetAddCssClass expander "dragged"
         void $ GTK.onDragSourceDragCancel dragSource $ \ _drag _reason ->
-          return False
-        void $ GTK.onDragSourceDragEnd dragSource $ \ drag _deleteData -> do
+          return True
+            -- NB: important; setting this to 'False' stops GDK
+            -- from properly clearing the drag cursor.
+        void $ GTK.onDragSourceDragEnd dragSource $ \ _drag _deleteData -> do
           GTK.widgetRemoveCssClass window "dragging-item"
           GTK.widgetRemoveCssClass expander "dragged"
-
-
-          -- The docs say the following isn't necessary, but I'm getting a
-          -- lingering drag item widget if I don't destroy the GDK surface manually.
-          mbSurf <- GDK.dragGetDragSurface drag
-          for_ mbSurf $ GDK.surfaceDestroy
 
         -- Connect signals for receiving a drop on this widget.
         dropTarget <- GTK.dropTargetNew GI.gtypeInt64 [ GDK.DragActionCopy ]
@@ -296,9 +297,9 @@ newLayerView window uniqueTVar historyTVar layersContentDebugLabel layersListMod
 
           ( _, layerItem ) <- treeListItemLayerItem listItem
           dat <- getLayerData layerItem
-          let mbDropTargetUnique = layerUnique_maybe dat
-          mbDragSourceUnique <- GIO.fromGValue val
-          if mbDropTargetUnique == mbDragSourceUnique
+          let dropTargetData = layerDragSource dat
+          dragSourceData <- GIO.fromGValue val
+          if dropTargetData == dragSourceData
           then return False -- Don't allow a drag onto ourselves.
           else do
             h <- GTK.widgetGetHeight expander
@@ -312,20 +313,20 @@ newLayerView window uniqueTVar historyTVar layersContentDebugLabel layersListMod
 
             putStrLn $ unlines
               [ "DND"
-              , "source: " ++ show mbDragSourceUnique
-              , "target: " ++ show mbDropTargetUnique
+              , "source: " ++ show dragSourceData
+              , "target: " ++ show dropTargetData
               , "droppedAbove: " ++ show droppedAbove
               , "expanded:" ++ show expanded
               ]
 
             History { present = ( newLayers, newMetaData ) } <- STM.atomically $ do
               hist@History { past, present = ( content@Content { contentLayers = layers }, meta ) } <- STM.readTVar historyTVar
-              let layers' = dragAndDropLayerUpdate mbDragSourceUnique mbDropTargetUnique droppedAbove expanded layers
+              let layers' = dragAndDropLayerUpdate dragSourceData dropTargetData droppedAbove expanded layers
                   content' = content { contentLayers = layers' }
                   hist' = History { past = past Seq.:|> content, present = ( content', meta ), future = [] }
               STM.writeTVar historyTVar hist'
               return hist
-            dragAndDropListModelUpdate mbDragSourceUnique mbDropTargetUnique droppedAbove expanded layersListModel
+            dragAndDropListModelUpdate dragSourceData dropTargetData droppedAbove expanded layersListModel
             let newDebugText = Text.intercalate "\n" $ prettyLayers $ layerDataForUI newMetaData ( contentLayers newLayers )
             GTK.labelSetText layersContentDebugLabel newDebugText
 
@@ -400,7 +401,7 @@ newLayerView window uniqueTVar historyTVar layersContentDebugLabel layersListMod
             GTK.widgetRemoveCssClass expander "cursor"
             GTK.widgetSetVisible checkButton True
             GTK.checkButtonSetActive checkButton checkBoxStatusVisible
-        GTK.editableSetText layerLabel layerText
+        GTK.labelSetText layerLabel layerText
 
   selectionModel <- GTK.noSelectionNew ( Just layersListModel )
   GTK.listViewNew ( Just selectionModel ) ( Just layersListFactory )
@@ -525,6 +526,8 @@ data History
 -- GTK UI data --
 -----------------
 
+type DragSourceData = Int64
+
 type Layers = [ Layer ]
 
 data Layer
@@ -532,10 +535,10 @@ data Layer
   | Layer { layerUnique :: !Unique, layerName :: !Text, layerVisible :: Bool }
   | Cursor
 
-layerUnique_maybe :: Layer -> Int64
-layerUnique_maybe ( Group { groupUnique } ) = fromIntegral $ unique groupUnique
-layerUnique_maybe ( Layer { layerUnique } ) = fromIntegral $ unique layerUnique
-layerUnique_maybe Cursor                    = -1
+layerDragSource :: Layer -> DragSourceData
+layerDragSource ( Group { groupUnique } ) = fromIntegral $ unique groupUnique
+layerDragSource ( Layer { layerUnique } ) = fromIntegral $ unique layerUnique
+layerDragSource Cursor                    = -1
 
 prettyLayers :: Layers -> [ Text ]
 prettyLayers = concatMap prettyLayer
@@ -619,10 +622,10 @@ layerSpecUniques = \case
 
 -- TODO
 
-dragAndDropLayerUpdate :: Int64 -> Int64 -> Bool -> Bool -> [ LayerSpec ] -> [ LayerSpec ]
-dragAndDropLayerUpdate dragSrc dropTgt dropAbove expanded layers = layers
+dragAndDropLayerUpdate :: DragSourceData -> DragSourceData -> Bool -> Bool -> [ LayerSpec ] -> [ LayerSpec ]
+dragAndDropLayerUpdate _dragSrc _dropTgt _dropAbove _expanded layers = layers
 
-dragAndDropListModelUpdate :: Int64 -> Int64 -> Bool -> Bool -> GTK.TreeListModel -> IO ()
+dragAndDropListModelUpdate :: DragSourceData -> DragSourceData -> Bool -> Bool -> GTK.TreeListModel -> IO ()
 dragAndDropListModelUpdate dragSrc dropTgt dropAbove expanded layersListModel = do
   nbItems <- GIO.listModelGetNItems layersListModel
   putStrLn $ unlines
