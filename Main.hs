@@ -1,3 +1,5 @@
+{-# LANGUAGE RecursiveDo #-}
+
 module Main where
 
 -- base
@@ -10,26 +12,26 @@ import Data.Foldable
   ( for_ )
 import Data.Int
   ( Int64 )
-import Data.IORef
-  ( IORef, newIORef, readIORef, writeIORef )
+--import Data.IORef
+--  ( IORef, newIORef, readIORef, writeIORef )
 import Data.Word
   ( Word64 )
-import Foreign
-  ( FunPtr, malloc, free )
-import Foreign.C
-  ( CString, CSize(..) )
-import Foreign.Ptr
-  ( Ptr, castPtr )
-import Foreign.Storable
-  ( Storable(..) )
+--import Foreign
+--  ( FunPtr, malloc, free )
+--import Foreign.C
+--  ( CString, CSize(..) )
+--import Foreign.Ptr
+--  ( Ptr, castPtr )
+--import Foreign.Storable
+--  ( Storable(..) )
 import GHC.Stack
   ( HasCallStack )
 import System.Environment
   ( setEnv )
 import System.Exit
   ( ExitCode(..), exitWith, exitSuccess )
-import System.IO.Unsafe
-  ( unsafePerformIO )
+--import System.IO.Unsafe
+--  ( unsafePerformIO )
 
 -- containers
 import Data.Map.Strict
@@ -51,7 +53,7 @@ import qualified Data.GI.Base as GI
 import qualified Data.GI.Base.GObject as GI
 import qualified Data.GI.Base.GType as GI
 import qualified Data.GI.Base.Overloading as GI
-import qualified Data.GI.Base.Utils as GI
+--import qualified Data.GI.Base.Utils as GI
 
 -- gi-gdk
 import qualified GI.Gdk as GDK
@@ -165,7 +167,7 @@ data LayerViewWidget =
     { layerViewExpander    :: GTK.TreeExpander
     , layerViewContentBox  :: GTK.Box
     , layerViewCheckButton :: GTK.CheckButton
-    , layerViewLabel       :: GTK.EditableLabel
+    , layerViewLabel       :: GTK.Label
     }
 
 setupNewLayerViewWidget :: GTK.ListItem -> IO ()
@@ -184,7 +186,7 @@ setupNewLayerViewWidget listItem = do
 
   checkBox <- GTK.checkButtonNew
   GTK.boxAppend contentBox checkBox
-  itemLabel <- GTK.editableLabelNew ""
+  itemLabel <- GTK.labelNew Nothing
   GTK.boxAppend contentBox itemLabel
 
 -- | Given a 'GTK.ListItem' widget that displays a row, get the
@@ -206,7 +208,7 @@ getLayerViewWidget listItem = do
           case mbCheckButton of
             Nothing -> error "getLayerViewWidget: expected ListItem->Expander->Box->CheckButton"
             Just checkButton -> do
-              mbLayerLabel <- traverse ( GTK.unsafeCastTo GTK.EditableLabel ) =<< GTK.widgetGetNextSibling checkButton
+              mbLayerLabel <- traverse ( GTK.unsafeCastTo GTK.Label ) =<< GTK.widgetGetNextSibling checkButton
               case mbLayerLabel of
                 Nothing -> error "getLayerViewWidget: expected ListItem->Expander->Box->{CheckButton,LayerLabel}"
                 Just layerLabel ->
@@ -226,7 +228,7 @@ newLayerView :: GTK.ApplicationWindow
              -> GTK.Label
              -> GTK.TreeListModel
              -> IO GTK.ListView
-newLayerView window uniqueTVar historyTVar layersContentDebugLabel layersListModel = do
+newLayerView window _uniqueTVar historyTVar layersContentDebugLabel layersListModel = mdo
   layersListFactory <- GTK.signalListItemFactoryNew
 
   -- Connect to "setup" signal to create generic widgets for viewing the tree.
@@ -237,9 +239,10 @@ newLayerView window uniqueTVar historyTVar layersContentDebugLabel layersListMod
 
         LayerViewWidget
           { layerViewExpander = expander
-          , layerViewLabel = label }
+          , layerViewLabel = _label }
             <- getLayerViewWidget listItem
 
+{-
         -- Connect a signal for editing the layer name.
         void $ GTK.onEditableChanged label $ do
           newLabel <- GTK.editableGetText ?self
@@ -260,7 +263,7 @@ newLayerView window uniqueTVar historyTVar layersContentDebugLabel layersListMod
           GI.gobjectSetPrivateData layerItem ( Just dat' )
           let newDebugText = Text.intercalate "\n" $ prettyLayers $ layerDataForUI newMetaData ( contentLayers newLayers )
           GTK.labelSetText layersContentDebugLabel newDebugText
-
+-}
 
         -- Connect signals for starting a drag from this widget.
         dragSource <- GTK.dragSourceNew
@@ -291,7 +294,7 @@ newLayerView window uniqueTVar historyTVar layersContentDebugLabel layersListMod
 
 
         -- Connect signals for receiving a drop on this widget.
-        dragSourceDataGType <- readIORef dragSourceGTypeRef
+        dragSourceDataGType <- return GI.gtypeInt64 -- readIORef dragSourceGTypeRef
         dropTarget <- GTK.dropTargetNew dragSourceDataGType [ GDK.DragActionCopy ]
 
         let dropTargetCleanup :: IO ()
@@ -341,7 +344,7 @@ newLayerView window uniqueTVar historyTVar layersContentDebugLabel layersListMod
                   hist' = History { past = past Seq.:|> content, present = ( content', meta ), future = [] }
               STM.writeTVar historyTVar hist'
               return hist
-            dragAndDropListModelUpdate dragSourceData dropTargetData droppedAbove expanded layersListModel
+            dragAndDropListModelUpdate dragSourceData dropTargetData droppedAbove expanded listView
             let newDebugText = Text.intercalate "\n" $ prettyLayers $ layerDataForUI newMetaData ( contentLayers newLayers )
             GTK.labelSetText layersContentDebugLabel newDebugText
 
@@ -415,10 +418,11 @@ newLayerView window uniqueTVar historyTVar layersContentDebugLabel layersListMod
             GTK.widgetRemoveCssClass expander "cursor"
             GTK.widgetSetVisible checkButton True
             GTK.checkButtonSetActive checkButton checkBoxStatusVisible
-        GTK.editableSetText layerLabel layerText
+        GTK.labelSetText layerLabel layerText
 
   selectionModel <- GTK.noSelectionNew ( Just layersListModel )
-  GTK.listViewNew ( Just selectionModel ) ( Just layersListFactory )
+  listView <- GTK.listViewNew ( Just selectionModel ) ( Just layersListFactory )
+  return listView
 
 getNextItem_maybe :: GTK.TreeExpander -> IO ( Maybe ( GTK.TreeExpander ) )
 getNextItem_maybe expander = do
@@ -442,7 +446,7 @@ getNextItem_maybe expander = do
 main :: IO ()
 main = do
   --setEnv "GTK_DEBUG" "actions,tree"
-  --setEnv "GDK_DEBUG" "dnd"
+  setEnv "GDK_DEBUG" "dnd"
   application <- GTK.applicationNew ( Just "com.layers" ) [ ]
   GIO.applicationRegister application ( Nothing @GIO.Cancellable )
   void $ GIO.onApplicationActivate application ( runApplication application )
@@ -467,7 +471,7 @@ runApplication application = do
 
   GTK.widgetAddCssClass window "list-store"
 
-  newDragSourceDataGType
+  --newDragSourceDataGType
 
   contentBox <- GTK.boxNew GTK.OrientationHorizontal 100
   layersBox  <- GTK.boxNew GTK.OrientationVertical 0
@@ -544,8 +548,9 @@ data History
 -- GTK UI data --
 -----------------
 
---type DragSourceData = Int64
+type DragSourceData = Int64
 
+{-
 data DragSourceData = CursorDrag | LayerDrag !Unique
   deriving stock ( Eq, Ord, Show )
 
@@ -616,6 +621,8 @@ instance GTK.IsGValue DragSourceData where
   gvalueSet_ gvalue = poke ( castPtr gvalue )
   gvalueGet_ gvalue = peek ( castPtr gvalue )
 
+-}
+
 type Layers = [ Layer ]
 
 data Layer
@@ -624,9 +631,9 @@ data Layer
   | Cursor
 
 layerDragSource :: Layer -> DragSourceData
-layerDragSource ( Group { groupUnique } ) = LayerDrag groupUnique
-layerDragSource ( Layer { layerUnique } ) = LayerDrag layerUnique
-layerDragSource Cursor                    = CursorDrag
+layerDragSource ( Group { groupUnique } ) = fromIntegral $ unique groupUnique -- LayerDrag groupUnique
+layerDragSource ( Layer { layerUnique } ) = fromIntegral $ unique layerUnique -- LayerDrag layerUnique
+layerDragSource Cursor                    = -1 -- CursorDrag
 
 prettyLayers :: Layers -> [ Text ]
 prettyLayers = concatMap prettyLayer
@@ -710,19 +717,23 @@ layerSpecUniques = \case
 -- TODO
 
 dragAndDropLayerUpdate :: DragSourceData -> DragSourceData -> Bool -> Bool -> [ LayerSpec ] -> [ LayerSpec ]
-dragAndDropLayerUpdate dragSrc dropTgt dropAbove expanded layers = layers
+dragAndDropLayerUpdate _dragSrc _dropTgt _dropAbove _expanded layers = layers
 
-dragAndDropListModelUpdate :: DragSourceData -> DragSourceData-> Bool -> Bool -> GTK.TreeListModel -> IO ()
-dragAndDropListModelUpdate dragSrc dropTgt dropAbove expanded layersListModel = do
-  nbItems <- GIO.listModelGetNItems layersListModel
-  putStrLn $ unlines
-    [ "dragAndDropListModelUpdate"
-    , "dragSrc: " ++ show dragSrc
-    , "dropTgt: " ++ show dropTgt
-    , "dropAbove: " ++ show dropAbove
-    , "expanded: " ++ show expanded
-    , "nbItems: " ++ show nbItems
-    ]
+dragAndDropListModelUpdate :: DragSourceData -> DragSourceData -> Bool -> Bool -> GTK.ListView -> IO ()
+dragAndDropListModelUpdate dragSrc dropTgt dropAbove expanded listView = do
+  mbLayersListModel <- GTK.listViewGetModel listView
+  case mbLayersListModel of
+    Nothing -> error "dragAndDropListModelUpdate: no underlying model"
+    Just layersListModel -> do
+      nbItems <- GIO.listModelGetNItems layersListModel
+      putStrLn $ unlines
+        [ "dragAndDropListModelUpdate"
+        , "dragSrc: " ++ show dragSrc
+        , "dropTgt: " ++ show dropTgt
+        , "dropAbove: " ++ show dropAbove
+        , "expanded: " ++ show expanded
+        , "nbItems: " ++ show nbItems
+        ]
 
   return ()
 
