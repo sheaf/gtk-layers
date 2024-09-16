@@ -49,7 +49,7 @@ executable gtk-layers
   default-extensions:
       BangPatterns
       DataKinds
-      DerivingStrategies
+      DerivingVia
       GeneralizedNewtypeDeriving
       ImplicitParams
       LambdaCase
