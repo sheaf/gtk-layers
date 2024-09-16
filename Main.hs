@@ -2,7 +2,7 @@ module Main where
 
 -- base
 import Control.Monad
-  ( void )
+  ( unless, void )
 import Data.Foldable
   ( for_ )
 import Data.Bits
@@ -172,7 +172,7 @@ data LayerViewWidget =
     { layerViewExpander    :: GTK.TreeExpander
     , layerViewContentBox  :: GTK.Box
     , layerViewCheckButton :: GTK.CheckButton
-    , layerViewLabel       :: GTK.Label
+    , layerViewLabel       :: GTK.EditableLabel
     }
 
 setupNewLayerViewWidget :: GTK.ListItem -> IO ()
@@ -191,8 +191,45 @@ setupNewLayerViewWidget listItem = do
 
   checkBox <- GTK.checkButtonNew
   GTK.boxAppend contentBox checkBox
-  itemLabel <- GTK.labelNew Nothing
+  itemLabel <- editableLabelNew
   GTK.boxAppend contentBox itemLabel
+
+-- | Create a new editable label, but remove any 'DragSource' or 'DropTarget'
+-- controllers attached to it, as we don't want the label to participate in
+-- drag-and-drop operations, especially because having it participate in
+-- drag-and-drop operations triggers segfaults due to a GTK bug.
+editableLabelNew :: IO GTK.EditableLabel
+editableLabelNew = do
+  label <- GTK.editableLabelNew " "
+  widget <- GTK.toWidget label
+  removeControllers widget
+  return label
+
+  where
+    removeControllers widget = do
+      controllers <- GTK.widgetObserveControllers widget
+      nbControllers <- GIO.listModelGetNItems controllers
+      unless ( nbControllers == 0 ) $
+        for_ [ 0 .. nbControllers - 1 ] $ \ i -> do
+          mbController <- GIO.listModelGetItem controllers i
+          for_ mbController $ \ controller -> do
+            mbDrag <- GTK.castTo GTK.DragSource controller
+            mbDrop <- GTK.castTo GTK.DropTarget controller
+            for_ mbDrag $ GTK.widgetRemoveController widget
+            for_ mbDrop $ GTK.widgetRemoveController widget
+      mbChild <- GTK.widgetGetFirstChild widget
+      case mbChild of
+        Nothing -> return ()
+        Just c -> do
+          removeControllers c
+          removeControllersSiblings c
+    removeControllersSiblings c = do
+      mbNext <- GTK.widgetGetNextSibling c
+      case mbNext of
+        Nothing -> return ()
+        Just next -> do
+          removeControllers next
+          removeControllersSiblings next
 
 -- | Given a 'GTK.ListItem' widget that displays a row, get the
 -- widget hierarchy so that we can modify them to display the appropriate
@@ -213,7 +250,7 @@ getLayerViewWidget listItem = do
           case mbCheckButton of
             Nothing -> error "getLayerViewWidget: expected ListItem->Expander->Box->CheckButton"
             Just checkButton -> do
-              mbLayerLabel <- traverse ( GTK.unsafeCastTo GTK.Label ) =<< GTK.widgetGetNextSibling checkButton
+              mbLayerLabel <- traverse ( GTK.unsafeCastTo GTK.EditableLabel ) =<< GTK.widgetGetNextSibling checkButton
               case mbLayerLabel of
                 Nothing -> error "getLayerViewWidget: expected ListItem->Expander->Box->{CheckButton,LayerLabel}"
                 Just layerLabel ->
@@ -247,31 +284,21 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
           , layerViewLabel = label }
             <- getLayerViewWidget listItem
 
-        return ()
-
-{- TODO: commented out because the DropTarget controllers attached
-         to editable labels cause segfaults.
-
         -- Connect a signal for editing the layer name.
         void $ GTK.onEditableChanged label $ do
           newLabel <- GTK.editableGetText ?self
           ( _, layerItem ) <- treeListItemLayerItem listItem
           dat <- getLayerData layerItem
-          let dat' = case dat of { l@( Layer {} ) -> l { layerName = newLabel }
-                                 ; g@( Group {} ) -> g { groupName = newLabel } }
-          History { present = ( newLayers, newMetaData ) } <- STM.atomically $ do
+          History { present = ( newContent, newMetadata ) } <- STM.atomically $ do
             hist@History { present = ( layers, meta@( Meta { names } ) ) } <- STM.readTVar historyTVar
             let names' = case dat of { Layer { layerUnique = u } -> Map.insert u newLabel names
-                                     ; Group { groupUnique = u } -> Map.insert u newLabel names }
+                                     ; Group { layerUnique = u } -> Map.insert u newLabel names }
                 meta' = meta { names = names' }
                 hist' = hist { present = ( layers, meta' ) }
             STM.writeTVar historyTVar hist'
             return hist
-          GI.gobjectSetPrivateData layerItem ( Just dat' )
-          let newDebugText = Text.intercalate "\n" $ prettyLayers $ layerDataForUI newMetaData ( contentLayers newLayers )
+          let newDebugText = Text.intercalate "\n" $ prettyLayers newContent newMetadata
           GTK.labelSetText layersContentDebugLabel newDebugText
--}
-
 
         -- Connect signals for starting a drag from this widget.
         dragSource <- GTK.dragSourceNew
@@ -452,7 +479,7 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
           Group {} -> do
             GTK.widgetSetVisible checkButton True
             GTK.checkButtonSetActive checkButton checkBoxStatusVisible
-        GTK.labelSetText layerLabel layerText
+        GTK.editableSetText layerLabel layerText
 
   selectionModel <- GTK.noSelectionNew ( Just layersListModel )
   GTK.listViewNew ( Just selectionModel ) ( Just layersListFactory )
