@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedLabels #-}
+
 module Main where
 
 -- base
@@ -263,7 +265,6 @@ getLayerViewWidget listItem = do
                       }
 
 -- | Create a new 'GTK.ListView' that displays 'LayerItem's.
-
 newLayerView :: GTK.ApplicationWindow
              -> STM.TVar Unique
              -> STM.TVar History
@@ -285,18 +286,21 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
             <- getLayerViewWidget listItem
 
         -- Connect a signal for editing the layer name.
-        void $ GTK.onEditableChanged label $ do
-          newLabel <- GTK.editableGetText ?self
+        --
+        -- NB: we don't use the 'onEditableChanged' signal, as that updates
+        -- after every key stroke.
+        void $ GI.after label ( GI.PropertyNotify #hasFocus ) $ \ _ -> do
+          newText <- GTK.editableGetText label
           ( _, layerItem ) <- treeListItemLayerItem listItem
           dat <- getLayerData layerItem
           History { present = ( newContent, newMetadata ) } <- STM.atomically $ do
             hist@History { present = ( layers, meta@( Meta { names } ) ) } <- STM.readTVar historyTVar
-            let names' = case dat of { Layer { layerUnique = u } -> Map.insert u newLabel names
-                                     ; Group { layerUnique = u } -> Map.insert u newLabel names }
+            let names' = case dat of { Layer { layerUnique = u } -> Map.insert u newText names
+                                     ; Group { layerUnique = u } -> Map.insert u newText names }
                 meta' = meta { names = names' }
                 hist' = hist { present = ( layers, meta' ) }
             STM.writeTVar historyTVar hist'
-            return hist
+            return hist'
           let newDebugText = Text.intercalate "\n" $ prettyLayers newContent newMetadata
           GTK.labelSetText layersContentDebugLabel newDebugText
 
