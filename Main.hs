@@ -307,7 +307,9 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
         -- Connect signals for starting a drag from this widget.
         dragSource <- GTK.dragSourceNew
 
-        void $ GTK.onDragSourcePrepare dragSource $ \ _x _y -> do
+        dragPos <- STM.newTVarIO @( Double, Double ) ( 0, 0 )
+
+        void $ GTK.onDragSourcePrepare dragSource $ \ x y -> do
           ( _, layerItem ) <- treeListItemLayerItem listItem
           dat <- getLayerData layerItem
 
@@ -320,14 +322,16 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
           mbSrcPar <- GTK.treeListRowGetParent treeListRow
           mbParSrcPos <- traverse GTK.treeListRowGetPosition mbSrcPar
 
-          let dragSourceData = mkDND_Data ( layerUnique dat ) srcPos mbParSrcPos
+          STM.atomically $ STM.writeTVar dragPos ( x, y )
 
+          let dragSourceData = mkDND_Data ( layerUnique dat ) srcPos mbParSrcPos
           val <- GDK.contentProviderNewForValue =<< GIO.toGValue dragSourceData
           GTK.widgetAddCssClass window "dragging-item"
           return $ Just val
         void $ GTK.onDragSourceDragBegin dragSource $ \ _drag -> do
+          ( x, y ) <- STM.readTVarIO dragPos
           paintable <- GTK.widgetPaintableNew ( Just expander )
-          GTK.dragSourceSetIcon ?self ( Just paintable ) 0 0
+          GTK.dragSourceSetIcon ?self ( Just paintable ) ( round x ) ( round y )
           GTK.widgetAddCssClass expander "dragged"
         void $ GTK.onDragSourceDragCancel dragSource $ \ _drag _reason ->
           return True

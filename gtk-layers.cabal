@@ -53,6 +53,7 @@ executable gtk-layers
       GeneralizedNewtypeDeriving
       ImplicitParams
       LambdaCase
+      LexicalNegation
       NamedFieldPuns
       OverloadedStrings
       TypeApplications
