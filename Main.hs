@@ -7,14 +7,18 @@ import Control.Monad
   ( unless, void )
 import Data.Foldable
   ( for_ )
-import Data.Bits
-  ( (.&.), shiftL, shiftR )
 import Data.Maybe
   ( catMaybes, fromMaybe, fromJust )
 import Data.List
   ( elemIndex )
 import Data.Word
   ( Word32, Word64 )
+import Foreign.StablePtr
+  ( StablePtr
+  , newStablePtr
+  , deRefStablePtr
+  , freeStablePtr
+  )
 import GHC.Stack
   ( HasCallStack )
 --import System.Environment
@@ -324,8 +328,14 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
 
           STM.atomically $ STM.writeTVar dragPos ( x, y )
 
-          let dragSourceData = mkDND_Data ( layerUnique dat ) srcPos mbParSrcPos
-          val <- GDK.contentProviderNewForValue =<< GIO.toGValue dragSourceData
+          let dragSourceData =
+                DND_Data
+                  { dnd_sourceUnique = layerUnique dat
+                  , dnd_sourceGlobalIndex = srcPos
+                  , dnd_sourceParentGlobalIndex = mbParSrcPos
+                  }
+          dragSourceDataPtr <- newStablePtr dragSourceData
+          val <- GDK.contentProviderNewForValue =<< GIO.toGValue @( StablePtr DND_Data ) dragSourceDataPtr
           GTK.widgetAddCssClass window "dragging-item"
           return $ Just val
         void $ GTK.onDragSourceDragBegin dragSource $ \ _drag -> do
@@ -363,8 +373,13 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
           dstLayer <- getLayerData layerItem
           let dropTgtUniq = layerUnique dstLayer
 
-          dragSrcData <- GIO.fromGValue @DND_Data val
-          let ( dragSrcUniq, dragSrcIx, mbDragSrcParentIx ) = dnd_Data dragSrcData
+          dragSrcDataPtr <- GIO.fromGValue @( StablePtr DND_Data ) val
+          DND_Data
+            { dnd_sourceUnique = dragSrcUniq
+            , dnd_sourceGlobalIndex = dragSrcIx
+            , dnd_sourceParentGlobalIndex = mbDragSrcParentIx
+            } <- deRefStablePtr dragSrcDataPtr
+          --freeStablePtr dragSrcDataPtr
 
           mbTreeListRow <- traverse ( GTK.unsafeCastTo GTK.TreeListRow ) =<< GTK.listItemGetItem listItem
           treeListRow <- case mbTreeListRow of
@@ -633,28 +648,13 @@ data History
 -- GTK UI data --
 -----------------
 
-newtype DND_Data = DND_Data Word64
-  deriving stock Show
-  deriving newtype Eq
-  deriving GTK.IsGValue
-    via Word64
-
-mkDND_Data :: Unique -> Word32 -> Maybe Word32 -> DND_Data
-mkDND_Data uniq pos mbParPos =
-  DND_Data $
-      unique uniq
-    + shiftL ( fromIntegral pos ) 32
-    + shiftL ( maybe 0 ( ( + 1 ) . fromIntegral ) mbParPos ) 48
-
-dnd_Data :: DND_Data -> ( Unique, Word32, Maybe Word32 )
-dnd_Data ( DND_Data dat ) =
-  ( Unique $ dat .&. 0xffffffff
-  , fromIntegral ( dat `shiftR` 32 ) .&. 0xffff
-  , case shiftR dat 48 of
-      0 -> Nothing
-      p -> Just $ fromIntegral $ p - 1
-  )
-
+data DND_Data =
+  DND_Data
+    { dnd_sourceUnique :: !Unique
+    , dnd_sourceGlobalIndex :: !Word32
+    , dnd_sourceParentGlobalIndex :: !( Maybe Word32 )
+    }
+  deriving stock ( Show, Eq )
 
 data Layer
   = Group { layerUnique :: !Unique }

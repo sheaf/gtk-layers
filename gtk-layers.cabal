@@ -35,7 +35,13 @@ executable gtk-layers
       base
     , containers
     , directory
-    , haskell-gi-base, gi-gdk, gi-gtk, gi-gio, gi-gobject
+    , haskell-gi-base
+    , haskell-gi
+        >= 0.26.11
+    , gi-gdk
+    , gi-gtk
+    , gi-gio
+    , gi-gobject
     , stm
     , text
     , transformers
