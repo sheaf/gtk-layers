@@ -171,22 +171,19 @@ treeListRowLayerItem = go 0
 --        - Label
 data LayerViewWidget =
   LayerViewWidget
-    { layerViewExpander    :: GTK.TreeExpander
-    , layerViewContentBox  :: GTK.Box
+    { layerViewContentBox  :: GTK.Box
     , layerViewCheckButton :: GTK.CheckButton
     , layerViewLabel       :: GTK.EditableLabel
     }
 
-setupNewLayerViewWidget :: GTK.ListItem -> IO ()
-setupNewLayerViewWidget listItem = do
+newLayerViewWidget :: IO GTK.TreeExpander
+newLayerViewWidget = do
 
   expander <- GTK.treeExpanderNew
-  GTK.listItemSetFocusable listItem False
+
   GTK.treeExpanderSetIndentForIcon  expander True
   GTK.treeExpanderSetIndentForDepth expander True
   GTK.treeExpanderSetHideExpander   expander False
-
-  GTK.listItemSetChild listItem ( Just expander )
 
   contentBox <- GTK.boxNew GTK.OrientationHorizontal 20
   GTK.treeExpanderSetChild expander ( Just contentBox )
@@ -195,6 +192,8 @@ setupNewLayerViewWidget listItem = do
   GTK.boxAppend contentBox checkBox
   itemLabel <- editableLabelNew
   GTK.boxAppend contentBox itemLabel
+
+  return expander
 
 -- | Create a new editable label, but remove any 'DragSource' or 'DropTarget'
 -- controllers attached to it, as we don't want the label to participate in
@@ -233,36 +232,29 @@ editableLabelNew = do
           removeControllers next
           removeControllersSiblings next
 
--- | Given a 'GTK.ListItem' widget that displays a row, get the
--- widget hierarchy so that we can modify them to display the appropriate
--- content.
-getLayerViewWidget :: GTK.ListItem -> IO LayerViewWidget
-getLayerViewWidget listItem = do
-  mbExpander <- GTK.listItemGetChild listItem
-  case mbExpander of
-    Nothing -> error "getLayerViewWidget: expected ListItem->Expander"
-    Just expander0 -> do
-      expander <- GTK.unsafeCastTo GTK.TreeExpander expander0
-      mbContentBox <- GTK.treeExpanderGetChild expander
-      case mbContentBox of
-        Nothing -> error "getLayerViewWidget: expected ListItem->Expander->Box"
-        Just contentBox0 -> do
-          contentBox <- GTK.unsafeCastTo GTK.Box contentBox0
-          mbCheckButton <- traverse ( GTK.unsafeCastTo GTK.CheckButton ) =<< GTK.widgetGetFirstChild contentBox
-          case mbCheckButton of
-            Nothing -> error "getLayerViewWidget: expected ListItem->Expander->Box->CheckButton"
-            Just checkButton -> do
-              mbLayerLabel <- traverse ( GTK.unsafeCastTo GTK.EditableLabel ) =<< GTK.widgetGetNextSibling checkButton
-              case mbLayerLabel of
-                Nothing -> error "getLayerViewWidget: expected ListItem->Expander->Box->{CheckButton,LayerLabel}"
-                Just layerLabel ->
-                  return $
-                    LayerViewWidget
-                      { layerViewExpander = expander
-                      , layerViewContentBox = contentBox
-                      , layerViewCheckButton = checkButton
-                      , layerViewLabel = layerLabel
-                      }
+-- | Get the widget hierarchy for a list item, so that we can modify
+-- the wdigets to display the appropriate content.
+getLayerViewWidget :: GTK.TreeExpander -> IO LayerViewWidget
+getLayerViewWidget expander = do
+  mbContentBox <- GTK.treeExpanderGetChild expander
+  case mbContentBox of
+    Nothing -> error "getLayerViewWidget: expected ListItem->Expander->Box"
+    Just contentBox0 -> do
+      contentBox <- GTK.unsafeCastTo GTK.Box contentBox0
+      mbCheckButton <- traverse ( GTK.unsafeCastTo GTK.CheckButton ) =<< GTK.widgetGetFirstChild contentBox
+      case mbCheckButton of
+        Nothing -> error "getLayerViewWidget: expected ListItem->Expander->Box->CheckButton"
+        Just checkButton -> do
+          mbLayerLabel <- traverse ( GTK.unsafeCastTo GTK.EditableLabel ) =<< GTK.widgetGetNextSibling checkButton
+          case mbLayerLabel of
+            Nothing -> error "getLayerViewWidget: expected ListItem->Expander->Box->{CheckButton,LayerLabel}"
+            Just layerLabel ->
+              return $
+                LayerViewWidget
+                  { layerViewContentBox = contentBox
+                  , layerViewCheckButton = checkButton
+                  , layerViewLabel = layerLabel
+                  }
 
 -- | Create a new 'GTK.ListView' that displays 'LayerItem's.
 newLayerView :: GTK.ApplicationWindow
@@ -279,11 +271,13 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
   _ <- GTK.onSignalListItemFactorySetup layersListFactory $ \ listItem0 -> do
 
         listItem <- GTK.unsafeCastTo GTK.ListItem listItem0
-        setupNewLayerViewWidget listItem
+        GTK.listItemSetFocusable listItem False
+
+        expander <- newLayerViewWidget
+        GTK.listItemSetChild listItem ( Just expander )
         LayerViewWidget
-          { layerViewExpander = expander
-          , layerViewLabel = label }
-            <- getLayerViewWidget listItem
+          { layerViewLabel = label }
+            <- getLayerViewWidget expander
 
         -- Connect a signal for editing the layer name.
         --
@@ -307,9 +301,7 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
         -- Connect signals for starting a drag from this widget.
         dragSource <- GTK.dragSourceNew
 
-        dragPos <- STM.newTVarIO @( Double, Double ) ( 0, 0 )
-
-        void $ GTK.onDragSourcePrepare dragSource $ \ x y -> do
+        void $ GTK.onDragSourcePrepare dragSource $ \ _x _y -> do
           ( _, layerItem ) <- treeListItemLayerItem listItem
           dat <- getLayerData layerItem
 
@@ -322,21 +314,25 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
           mbSrcPar <- GTK.treeListRowGetParent treeListRow
           mbParSrcPos <- traverse GTK.treeListRowGetPosition mbSrcPar
 
-          STM.atomically $ STM.writeTVar dragPos ( x, y )
-
           let dragSourceData = mkDND_Data ( layerUnique dat ) srcPos mbParSrcPos
           val <- GDK.contentProviderNewForValue =<< GIO.toGValue dragSourceData
           GTK.widgetAddCssClass window "dragging-item"
           return $ Just val
         void $ GTK.onDragSourceDragBegin dragSource $ \ _drag -> do
-          ( x, y ) <- STM.readTVarIO dragPos
-          paintable <- GTK.widgetPaintableNew ( Just expander )
+{- To set a cursor icon for the drag, write the x/y coordinates in the
+   'prepare' signal handler to an IORef, and then use the following:
+          ( x, y ) <- readIORef dragPosRef
+          paintable <- GDK.widgetPaintableNew ( Just expander )
           GTK.dragSourceSetIcon ?self ( Just paintable ) ( round x ) ( round y )
+-}
+          noPaintable <- GDK.paintableNewEmpty 0 0
+          GTK.dragSourceSetIcon ?self ( Just noPaintable) 0 0
           GTK.widgetAddCssClass expander "dragged"
+          -- TODO: add "dragged" class for all descendants as well.
         void $ GTK.onDragSourceDragCancel dragSource $ \ _drag _reason ->
           return True
-            -- NB: important; setting this to 'False' stops GDK
-            -- from properly clearing the drag cursor.
+              -- ^^^^ Important. Setting this to 'False' stops GDK
+              -- from properly clearing the drag cursor.
         void $ GTK.onDragSourceDragEnd dragSource $ \ _drag _deleteData -> do
           GTK.widgetRemoveCssClass window "dragging-item"
           GTK.widgetRemoveCssClass expander "dragged"
@@ -373,7 +369,11 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
 
           isDescendent <- isDescendentOf dragSrcUniq listItem
           if isDescendent
-          then return False -- Don't allow a drag onto ourselves or any of our descendents.
+          then return False
+            -- Don't allow a drag onto ourselves or any of our descendents.
+            -- TODO: if we are the last item in a group, a drag on the bottom
+            -- part of ourselves could be used to mean "move out of group",
+            -- which would be useful.
           else do
             h <- GTK.widgetGetHeight expander
             let droppedAbove = y < 0.5 * fromIntegral h
@@ -457,11 +457,16 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
   _ <- GTK.onSignalListItemFactoryBind layersListFactory $ \ listItem0 -> do
 
         listItem <- GTK.unsafeCastTo GTK.ListItem listItem0
+        mbExpander <- GTK.listItemGetChild listItem
+        expander <-
+          case mbExpander of
+            Nothing -> error "layerView onBind: list item has no child"
+            Just expander0 -> GTK.unsafeCastTo GTK.TreeExpander expander0
+
         LayerViewWidget
-          { layerViewExpander    = expander
-          , layerViewCheckButton = checkButton
+          { layerViewCheckButton = checkButton
           , layerViewLabel       = layerLabel
-          } <- getLayerViewWidget listItem
+          } <- getLayerViewWidget expander
 
         ( _, layerItem ) <- treeListItemLayerItem listItem
         dat <- getLayerData layerItem

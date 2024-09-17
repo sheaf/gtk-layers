@@ -35,12 +35,12 @@ row {
   border-color: rgba(0, 191, 255, 0.2);
 }
 
-/* Style when dragged over */
+/* Style when dragging over an item */
 .drag-over.layer-item {
   background-color: rgb(219, 233, 255);
 }
 
-/* Style when dragged over the top part */
+/* Style when dragging over the top part of an item */
 .drag-top.layer-item {
   border-top: 2px solid rgb(0, 191, 255);
   margin-top: -2px;
@@ -49,7 +49,7 @@ row {
     inset 0 8px 6px -6px rgba(94, 234, 255, 0.5);
 }
 
-/* Style when dragged over the bottom part */
+/* Style when dragging over the bottom part of an item */
 .drag-bot.layer-item {
   border-bottom: 2px solid rgb(0, 191, 255);
   margin-bottom: -2px;
@@ -60,4 +60,6 @@ row {
 /* Style for item being dragged */
 .dragged.layer-item {
   background-color: grey;
+  transition:
+    background-color 0.3s ease-in-out;
 }
