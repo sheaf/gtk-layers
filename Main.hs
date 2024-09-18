@@ -13,10 +13,6 @@ import Data.List
   ( elemIndex )
 import Data.Word
   ( Word32, Word64 )
-import Foreign.StablePtr
-  ( StablePtr
-  , newStablePtr, deRefStablePtr, freeStablePtr
-  )
 import GHC.Stack
   ( HasCallStack )
 import System.Environment
@@ -43,6 +39,7 @@ import qualified System.Directory as Directory
 import qualified Data.GI.Base as GI
 import qualified Data.GI.Base.GObject as GI
 import qualified Data.GI.Base.GType as GI
+import qualified Data.GI.Base.GValue as GI
 import qualified Data.GI.Base.Overloading as GI
 
 -- gi-gdk
@@ -254,14 +251,14 @@ getLayerViewWidget expander = do
                   }
 
 -- | Create a new 'GTK.ListView' that displays 'LayerItem's.
-newLayerView :: GTK.ApplicationWindow
+newLayerView :: GTK.Box
              -> STM.TVar Unique
              -> STM.TVar History
              -> GTK.Label
              -> GIO.ListStore
              -> GTK.TreeListModel
              -> IO GTK.ListView
-newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore layersListModel = do
+newLayerView layersBox _uniqueTVar historyTVar layersContentDebugLabel rootStore layersListModel = do
   layersListFactory <- GTK.signalListItemFactoryNew
 
   -- Connect to "setup" signal to create generic widgets for viewing the tree.
@@ -299,6 +296,7 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
 
         -- Connect signals for starting a drag from this widget.
         dragSource <- GTK.dragSourceNew
+        GTK.dragSourceSetActions dragSource [ GDK.DragActionCopy ]
 
         void $ GTK.onDragSourcePrepare dragSource $ \ _x _y -> do
           ( _, layerItem ) <- treeListItemLayerItem listItem
@@ -319,11 +317,11 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
                   , dnd_sourceGlobalIndex = srcPos
                   , dnd_sourceParentGlobalIndex = mbParSrcPos
                   }
-          dragSourceDataPtr <- newStablePtr dragSourceData
-          val <- GDK.contentProviderNewForValue =<< GIO.toGValue @( StablePtr DND_Data ) dragSourceDataPtr
-          GTK.widgetAddCssClass window "dragging-item"
+          val <- GDK.contentProviderNewForValue =<< GIO.toGValue ( GI.HValue dragSourceData )
+          GTK.widgetAddCssClass layersBox "dragging-item"
           return $ Just val
         void $ GTK.onDragSourceDragBegin dragSource $ \ _drag -> do
+
 {- To set a cursor icon for the drag, write the x/y coordinates in the
    'prepare' signal handler to an IORef, and then use the following:
           ( x, y ) <- readIORef dragPosRef
@@ -334,16 +332,18 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
           GTK.dragSourceSetIcon ?self ( Just noPaintable ) 0 0
           GTK.widgetAddCssClass expander "dragged"
           -- TODO: add "dragged" class for all descendants as well.
-        void $ GTK.onDragSourceDragCancel dragSource $ \ _drag _reason ->
+        void $ GTK.onDragSourceDragCancel dragSource $ \ _drag _reason -> do
+          GTK.widgetRemoveCssClass layersBox "dragging-item"
+          GTK.widgetRemoveCssClass expander "dragged"
           return True
               -- ^^^^ Important. Setting this to 'False' stops GDK
               -- from properly clearing the drag cursor.
         void $ GTK.onDragSourceDragEnd dragSource $ \ _drag _deleteData -> do
-          GTK.widgetRemoveCssClass window "dragging-item"
+          GTK.widgetRemoveCssClass layersBox "dragging-item"
           GTK.widgetRemoveCssClass expander "dragged"
 
         -- Connect signals for receiving a drop on this widget.
-        dropTarget <- GTK.dropTargetNew GI.gtypeStablePtr [ GDK.DragActionCopy ]
+        dropTarget <- GTK.dropTargetNew GI.gtypeHValue [ GDK.DragActionCopy ]
 
         let dropTargetCleanup = do
               GTK.widgetRemoveCssClass expander "drag-over"
@@ -353,23 +353,24 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
               for_ mbNextItem $ \ nextItem -> do
                 GTK.widgetRemoveCssClass nextItem "drag-top"
         void $ GTK.onDropTargetAccept dropTarget $ \ _drop -> do
-          ( _, layerItem ) <- treeListItemLayerItem listItem
-          dat <- getLayerData layerItem
-          case dat of
-            Group {} -> return True
-            Layer {} -> return True
+          return True
+          --( _, layerItem ) <- treeListItemLayerItem listItem
+          --dat <- getLayerData layerItem
+          --case dat of
+          --  Group {} -> return True
+          --  Layer {} -> return True
         void $ GTK.onDropTargetDrop dropTarget $ \ val _x y -> do
+          dropTargetCleanup
           ( _, layerItem ) <- treeListItemLayerItem listItem
           dstLayer <- getLayerData layerItem
           let dropTgtUniq = layerUnique dstLayer
 
-          dragSrcDataPtr <- GIO.fromGValue @( StablePtr DND_Data ) val
-          DND_Data
-            { dnd_sourceUnique = dragSrcUniq
-            , dnd_sourceGlobalIndex = dragSrcIx
-            , dnd_sourceParentGlobalIndex = mbDragSrcParentIx
-            } <- deRefStablePtr dragSrcDataPtr
-          freeStablePtr dragSrcDataPtr
+          GI.HValue
+            ( DND_Data
+              { dnd_sourceUnique = dragSrcUniq
+              , dnd_sourceGlobalIndex = dragSrcIx
+              , dnd_sourceParentGlobalIndex = mbDragSrcParentIx
+              } ) <- GIO.fromGValue @( GI.HValue DND_Data ) val
 
           mbTreeListRow <- traverse ( GTK.unsafeCastTo GTK.TreeListRow ) =<< GTK.listItemGetItem listItem
           treeListRow <- case mbTreeListRow of
@@ -378,7 +379,8 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
 
           isDescendent <- isDescendentOf dragSrcUniq listItem
           if isDescendent
-          then return False
+          then do
+            return False
             -- Don't allow a drag onto ourselves or any of our descendents.
             -- TODO: if we are the last item in a group, a drag on the bottom
             -- part of ourselves could be used to mean "move out of group",
@@ -415,6 +417,7 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
                 STM.writeTVar historyTVar hist'
                 return ( hist', dndCtxt )
             -- TODO: probably need to take a lock here to avoid funny business?
+{-
             putStrLn $ unlines
               [ "dnd"
               , "dragSrcUniq: " ++ show dragSrcUniq
@@ -422,17 +425,18 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
               , "drop inside group: " ++ show ( expanded && not droppedAbove )
               , "newContent: " ++ show newContent
               ]
+-}
             dragAndDropListModelUpdate rootStore layersListModel ( dragSrcIx, mbDragSrcParentIx, srcChildIx ) ( mbDstParPos, dstChildIx )
             let newDebugText = Text.intercalate "\n" $ prettyLayers newContent newMetadata
             GTK.labelSetText layersContentDebugLabel newDebugText
-
             return True
 
         void $ GTK.onDropTargetEnter dropTarget $ \ _x y -> do
           GTK.widgetAddCssClass expander "drag-over"
           h <- GTK.widgetGetHeight expander
           if y < 0.5 * fromIntegral h
-          then GTK.widgetAddCssClass expander "drag-top"
+          then do
+            GTK.widgetAddCssClass expander "drag-top"
           else do
             GTK.widgetAddCssClass expander "drag-bot"
             mbNextItem <- getNextItem_maybe expander
@@ -455,7 +459,7 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
             for_ mbNextItem $ \ nextItem -> do
               GTK.widgetAddCssClass nextItem "drag-top"
           return [ GDK.DragActionCopy ]
-        void $ GTK.onDropTargetLeave dropTarget $
+        void $ GTK.onDropTargetLeave dropTarget $ do
           dropTargetCleanup
 
         GTK.widgetAddController expander dragSource
@@ -555,6 +559,8 @@ isDescendentOf u listItem = do
 main :: IO ()
 main = do
   setEnv "GDK_SCALE" "2"
+  --setEnv "GTK_DEBUG" "actions,tree,layout"
+  --setEnv "GDK_DEBUG" "misc,events,input,dnd"
   application <- GTK.applicationNew ( Just "com.layers" ) [ ]
   GIO.applicationRegister application ( Nothing @GIO.Cancellable )
   void $ GIO.onApplicationActivate application ( runApplication application )
@@ -591,7 +597,7 @@ runApplication application = do
   historyTVar <- STM.newTVarIO @History testInitialHistory
 
   ( rootStore, layers ) <- newLayersListModel historyTVar
-  layersView <- newLayerView window uniqueTVar historyTVar internalLayersLabel rootStore layers
+  layersView <- newLayerView layersBox uniqueTVar historyTVar internalLayersLabel rootStore layers
   GTK.listViewSetShowSeparators layersView False
 
   GTK.boxAppend layersBox layersView
@@ -733,7 +739,7 @@ dragAndDropLayerUpdate srcUniq ( mbTgtUniq, dropAbove ) mbSrcParent mbDstParent 
                              if dropAbove
                              then bef ++ [ srcUniq ] ++ aft
                              else bef ++ take 1 aft ++ [ srcUniq ] ++ drop 1 aft
-               ), fromIntegral $ length bef + ( if dropAbove then 0 else 1 ) )
+               ), fromIntegral $ length ( takeWhile ( /= tgtUniq ) $ newPar_cs ) + ( if dropAbove then 0 else 1 ) )
 
     hierarchy'
         -- Add the item to its new parent.
@@ -747,9 +753,10 @@ dragAndDropLayerUpdate srcUniq ( mbTgtUniq, dropAbove ) mbSrcParent mbDstParent 
   in
     ( hierarchy', ( oldChildPos, newChildPos ) )
 
-dragAndDropListModelUpdate :: GIO.ListStore -> GTK.TreeListModel ->( Word32, Maybe Word32, Word32 ) -> ( Maybe Word32, Word32 ) -> IO ()
+dragAndDropListModelUpdate :: GIO.ListStore -> GTK.TreeListModel -> ( Word32, Maybe Word32, Word32 ) -> ( Maybe Word32, Word32 ) -> IO ()
 dragAndDropListModelUpdate rootStore layersListModel ( srcIx, mbSrcParentPos, srcChildIx ) ( mbDstParentPos, dstChildIx ) = do
 
+{-
   putStrLn $ unlines
     [ "dragAndDropListModelUpdate"
     , "srcIx: " ++ show srcIx
@@ -758,12 +765,15 @@ dragAndDropListModelUpdate rootStore layersListModel ( srcIx, mbSrcParentPos, sr
     , "mbDstParentPos: " ++ show mbDstParentPos
     , "dstChildIx: " ++ show dstChildIx
     ]
+-}
 
   treeListRow <- GTK.unsafeCastTo GTK.TreeListRow =<< fmap fromJust ( GIO.listModelGetItem layersListModel srcIx )
+
   item <- GTK.unsafeCastTo LayerItem =<< fmap fromJust ( GTK.treeListRowGetItem treeListRow )
 
-  removeSrc
-  insertDst item
+  if ( mbSrcParentPos, srcChildIx ) < ( mbDstParentPos, dstChildIx )
+  then do { insertDst item; removeSrc }
+  else do { removeSrc; insertDst item }
 
   where
     removeSrc =
