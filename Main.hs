@@ -422,7 +422,7 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
               , "drop inside group: " ++ show ( expanded && not droppedAbove )
               , "newContent: " ++ show newContent
               ]
-            dragAndDropListModelUpdate rootStore layersListModel ( dragSrcIx, mbDragSrcParentIx, srcChildIx ) ( mbDstParPos, dstChildIx )
+            --dragAndDropListModelUpdate rootStore layersListModel ( dragSrcIx, mbDragSrcParentIx, srcChildIx ) ( mbDstParPos, dstChildIx )
             let newDebugText = Text.intercalate "\n" $ prettyLayers newContent newMetadata
             GTK.labelSetText layersContentDebugLabel newDebugText
 
