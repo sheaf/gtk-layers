@@ -35,7 +35,13 @@ executable gtk-layers
       base
     , containers
     , directory
-    , haskell-gi-base, gi-gdk, gi-gtk, gi-gio, gi-gobject
+    , haskell-gi-base
+    , gi-gdk
+       >= 4.0.9
+       -- 4.0.9 fixes a bug with contentProviderNewForValue
+    , gi-gtk
+    , gi-gio
+    , gi-gobject
     , stm
     , text
     , transformers

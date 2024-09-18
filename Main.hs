@@ -7,18 +7,20 @@ import Control.Monad
   ( unless, void )
 import Data.Foldable
   ( for_ )
-import Data.Bits
-  ( (.&.), shiftL, shiftR )
 import Data.Maybe
   ( catMaybes, fromMaybe, fromJust )
 import Data.List
   ( elemIndex )
 import Data.Word
   ( Word32, Word64 )
+import Foreign.StablePtr
+  ( StablePtr
+  , newStablePtr, deRefStablePtr, freeStablePtr
+  )
 import GHC.Stack
   ( HasCallStack )
---import System.Environment
---  ( setEnv )
+import System.Environment
+  ( setEnv )
 import System.Exit
   ( ExitCode(..), exitWith, exitSuccess )
 
@@ -314,8 +316,14 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
           mbSrcPar <- GTK.treeListRowGetParent treeListRow
           mbParSrcPos <- traverse GTK.treeListRowGetPosition mbSrcPar
 
-          let dragSourceData = mkDND_Data ( layerUnique dat ) srcPos mbParSrcPos
-          val <- GDK.contentProviderNewForValue =<< GIO.toGValue dragSourceData
+          let dragSourceData =
+                DND_Data
+                  { dnd_sourceUnique = layerUnique dat
+                  , dnd_sourceGlobalIndex = srcPos
+                  , dnd_sourceParentGlobalIndex = mbParSrcPos
+                  }
+          dragSourceDataPtr <- newStablePtr dragSourceData
+          val <- GDK.contentProviderNewForValue =<< GIO.toGValue @( StablePtr DND_Data ) dragSourceDataPtr
           GTK.widgetAddCssClass window "dragging-item"
           return $ Just val
         void $ GTK.onDragSourceDragBegin dragSource $ \ _drag -> do
@@ -338,7 +346,7 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
           GTK.widgetRemoveCssClass expander "dragged"
 
         -- Connect signals for receiving a drop on this widget.
-        dropTarget <- GTK.dropTargetNew GI.gtypeUInt64 [ GDK.DragActionCopy ]
+        dropTarget <- GTK.dropTargetNew GI.gtypeStablePtr [ GDK.DragActionCopy ]
 
         let dropTargetCleanup = do
               GTK.widgetRemoveCssClass expander "drag-over"
@@ -359,8 +367,13 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
           dstLayer <- getLayerData layerItem
           let dropTgtUniq = layerUnique dstLayer
 
-          dragSrcData <- GIO.fromGValue @DND_Data val
-          let ( dragSrcUniq, dragSrcIx, mbDragSrcParentIx ) = dnd_Data dragSrcData
+          dragSrcDataPtr <- GIO.fromGValue @( StablePtr DND_Data ) val
+          DND_Data
+            { dnd_sourceUnique = dragSrcUniq
+            , dnd_sourceGlobalIndex = dragSrcIx
+            , dnd_sourceParentGlobalIndex = mbDragSrcParentIx
+            } <- deRefStablePtr dragSrcDataPtr
+          freeStablePtr dragSrcDataPtr
 
           mbTreeListRow <- traverse ( GTK.unsafeCastTo GTK.TreeListRow ) =<< GTK.listItemGetItem listItem
           treeListRow <- case mbTreeListRow of
@@ -413,7 +426,7 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
               , "drop inside group: " ++ show ( expanded && not droppedAbove )
               , "newContent: " ++ show newContent
               ]
-            dragAndDropListModelUpdate ( dragSrcIx, mbDragSrcParentIx, srcChildIx ) ( mbDstParPos, dstChildIx ) rootStore layersListModel
+            dragAndDropListModelUpdate rootStore layersListModel ( dragSrcIx, mbDragSrcParentIx, srcChildIx ) ( mbDstParPos, dstChildIx )
             let newDebugText = Text.intercalate "\n" $ prettyLayers newContent newMetadata
             GTK.labelSetText layersContentDebugLabel newDebugText
 
@@ -546,6 +559,7 @@ isDescendentOf u listItem = do
 
 main :: IO ()
 main = do
+  setEnv "GDK_SCALE" "2"
   application <- GTK.applicationNew ( Just "com.layers" ) [ ]
   GIO.applicationRegister application ( Nothing @GIO.Cancellable )
   void $ GIO.onApplicationActivate application ( runApplication application )
@@ -568,7 +582,7 @@ runApplication application = do
   GTK.cssProviderLoadFromPath cssProvider themePath
   GTK.styleContextAddProviderForDisplay display cssProvider 1000
 
-  GTK.widgetAddCssClass window "list-store"
+  GTK.widgetAddCssClass window "gtk-layers"
 
   contentBox <- GTK.boxNew GTK.OrientationHorizontal 100
   layersBox  <- GTK.boxNew GTK.OrientationVertical 0
@@ -638,28 +652,13 @@ data History
 -- GTK UI data --
 -----------------
 
-newtype DND_Data = DND_Data Word64
-  deriving stock Show
-  deriving newtype Eq
-  deriving GTK.IsGValue
-    via Word64
-
-mkDND_Data :: Unique -> Word32 -> Maybe Word32 -> DND_Data
-mkDND_Data uniq pos mbParPos =
-  DND_Data $
-      unique uniq
-    + shiftL ( fromIntegral pos ) 32
-    + shiftL ( maybe 0 ( ( + 1 ) . fromIntegral ) mbParPos ) 48
-
-dnd_Data :: DND_Data -> ( Unique, Word32, Maybe Word32 )
-dnd_Data ( DND_Data dat ) =
-  ( Unique $ dat .&. 0xffffffff
-  , fromIntegral ( dat `shiftR` 32 ) .&. 0xffff
-  , case shiftR dat 48 of
-      0 -> Nothing
-      p -> Just $ fromIntegral $ p - 1
-  )
-
+data DND_Data =
+  DND_Data
+    { dnd_sourceUnique :: !Unique
+    , dnd_sourceGlobalIndex :: !Word32
+    , dnd_sourceParentGlobalIndex :: !( Maybe Word32 )
+    }
+  deriving stock ( Show, Eq )
 
 data Layer
   = Group { layerUnique :: !Unique }
@@ -755,8 +754,8 @@ dragAndDropLayerUpdate srcUniq ( mbTgtUniq, dropAbove ) mbSrcParent mbDstParent 
   in
     ( hierarchy', ( oldChildPos, newChildPos ) )
 
-dragAndDropListModelUpdate :: ( Word32, Maybe Word32, Word32 ) -> ( Maybe Word32, Word32 ) -> GIO.ListStore -> GTK.TreeListModel -> IO ()
-dragAndDropListModelUpdate ( srcIx, mbSrcParentPos, srcChildIx ) ( mbDstParentPos, dstChildIx ) rootStore layersListModel = do
+dragAndDropListModelUpdate :: GIO.ListStore -> GTK.TreeListModel ->( Word32, Maybe Word32, Word32 ) -> ( Maybe Word32, Word32 ) -> IO ()
+dragAndDropListModelUpdate rootStore layersListModel ( srcIx, mbSrcParentPos, srcChildIx ) ( mbDstParentPos, dstChildIx ) = do
 
   putStrLn $ unlines
     [ "dragAndDropListModelUpdate"
