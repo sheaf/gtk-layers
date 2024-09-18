@@ -72,20 +72,15 @@ import qualified Paths_gtk_layers as Cabal
 
 --------------------------------------------------------------------------------
 
-(!) :: ( HasCallStack, Ord k, Show k ) => Map k a -> k -> a
-m ! k = case Map.lookup k m of
-  Nothing -> error $ "lookup failed; key = " ++ show k
-  Just r -> r
-
 -- | Create a new 'GTK.TreeListModel' from the given set of layers.
 newLayersListModel :: STM.TVar History -> IO ( GIO.ListStore, GTK.TreeListModel )
 newLayersListModel historyTVar = do
   itemType <- GI.glibType @LayerItem
   store <- GIO.listStoreNew itemType
   ( Content { layerHierarchy }, _ ) <- present <$> STM.readTVarIO historyTVar
-  let topLayers = fromMaybe [] . snd $ layerHierarchy ! Nothing
+  let topLayers = fromMaybe [] . snd $ layerHierarchy Map.! Nothing
   for_ topLayers $ \ layerUniq -> do
-    let ( _parent, mbChildren ) = layerHierarchy ! ( Just layerUniq )
+    let ( _parent, mbChildren ) = layerHierarchy Map.! ( Just layerUniq )
         layer = case mbChildren of
           Nothing -> Layer { layerUnique = layerUniq }
           Just {} -> Group { layerUnique = layerUniq }
@@ -113,13 +108,13 @@ newLayersListModel historyTVar = do
               Layer  {} -> return Nothing
               Group { layerUnique = groupUnique } -> do
                 ( Content { layerHierarchy }, _ ) <- present <$> STM.readTVarIO historyTVar
-                let children = fromMaybe [] . snd $ layerHierarchy ! ( Just groupUnique )
+                let children = fromMaybe [] . snd $ layerHierarchy Map.! ( Just groupUnique )
                 -- NB: create a simple GIO.ListStore, not a nested GTK.TreeListModel,
                 -- as that would cause e.g. grand-children model to be created twice.
                 itemType <- GI.glibType @LayerItem
                 store <- GIO.listStoreNew itemType
                 for_ children $ \ childUniq -> do
-                  let mbChildChildren = snd $ layerHierarchy ! ( Just childUniq )
+                  let mbChildChildren = snd $ layerHierarchy Map.! ( Just childUniq )
                       childLayer = case mbChildChildren of
                         Nothing -> Layer { layerUnique = childUniq }
                         Just {} -> Group { layerUnique = childUniq }
@@ -277,6 +272,8 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
 
         expander <- newLayerViewWidget
         GTK.listItemSetChild listItem ( Just expander )
+        GTK.widgetAddCssClass expander "layer-item"
+
         LayerViewWidget
           { layerViewLabel = label }
             <- getLayerViewWidget expander
@@ -334,7 +331,7 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
           GTK.dragSourceSetIcon ?self ( Just paintable ) ( round x ) ( round y )
 -}
           noPaintable <- GDK.paintableNewEmpty 0 0
-          GTK.dragSourceSetIcon ?self ( Just noPaintable) 0 0
+          GTK.dragSourceSetIcon ?self ( Just noPaintable ) 0 0
           GTK.widgetAddCssClass expander "dragged"
           -- TODO: add "dragged" class for all descendants as well.
         void $ GTK.onDragSourceDragCancel dragSource $ \ _drag _reason ->
@@ -362,7 +359,6 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
             Group {} -> return True
             Layer {} -> return True
         void $ GTK.onDropTargetDrop dropTarget $ \ val _x y -> do
-
           ( _, layerItem ) <- treeListItemLayerItem listItem
           dstLayer <- getLayerData layerItem
           let dropTgtUniq = layerUnique dstLayer
@@ -407,12 +403,12 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
             ( History { present = ( newContent, newMetadata ) }, ( srcChildIx, dstChildIx ) )
               <- STM.atomically $ do
                 History { past, present = ( content@Content { layerHierarchy = hierarchy }, meta ) } <- STM.readTVar historyTVar
-                let mbSrcParent = fst $ hierarchy ! Just dragSrcUniq
+                let mbSrcParent = fst $ hierarchy Map.! Just dragSrcUniq
                     ( mbDstParent, mbDropTgtUniq )
                       | not droppedAbove && expanded
                       = ( Just dropTgtUniq, Nothing )
                       | otherwise
-                      = ( fst $ hierarchy ! Just dropTgtUniq, Just dropTgtUniq )
+                      = ( fst $ hierarchy Map.! Just dropTgtUniq, Just dropTgtUniq )
                 let ( hierarchy', dndCtxt ) = dragAndDropLayerUpdate dragSrcUniq ( mbDropTgtUniq, droppedAbove ) mbSrcParent mbDstParent hierarchy
                     content' = content { layerHierarchy = hierarchy' }
                     hist' = History { past = past Seq.:|> content, present = ( content', meta ), future = [] }
@@ -432,7 +428,6 @@ newLayerView window _uniqueTVar historyTVar layersContentDebugLabel rootStore la
 
             return True
 
-        GTK.widgetAddCssClass expander "layer-item"
         void $ GTK.onDropTargetEnter dropTarget $ \ _x y -> do
           GTK.widgetAddCssClass expander "drag-over"
           h <- GTK.widgetGetHeight expander
@@ -666,17 +661,17 @@ data Layer
 
 layerNameAndVisible :: Meta -> Unique -> ( Text, Bool )
 layerNameAndVisible ( Meta { names, invisibles } ) unique =
-  ( names ! unique, unique `notElem` invisibles )
+  ( names Map.! unique, unique `notElem` invisibles )
 
 prettyLayers :: Content -> Meta -> [ Text ]
 prettyLayers ( Content { layerHierarchy } ) meta =
-  concatMap go ( fromMaybe [] . snd $ layerHierarchy ! Nothing )
+  concatMap go ( fromMaybe [] . snd $ layerHierarchy Map.! Nothing )
     where
       go :: Unique -> [ Text ]
       go i =
         let ( name, visible ) = layerNameAndVisible meta i
         in
-          case snd $ layerHierarchy ! ( Just i ) of
+          case snd $ layerHierarchy Map.! ( Just i ) of
             Nothing ->
               [ "- Layer { layerName = \"" <> name <> "\", layerVisible = " <> Text.pack ( show visible ) <> " } " ]
             Just cs ->
@@ -711,14 +706,12 @@ getLayerData item = do
 --------------------------------------------------------------------------------
 -- Drag and drop update.
 
--- TODO
-
 dragAndDropLayerUpdate :: Unique -> ( Maybe Unique, Bool ) -> Maybe Unique -> Maybe Unique -> LayerHierarchy -> ( LayerHierarchy, ( Word32, Word32 ) )
 dragAndDropLayerUpdate srcUniq ( mbTgtUniq, dropAbove ) mbSrcParent mbDstParent hierarchy =
 
   let
-    ( oldPar_p, fromJust -> oldPar_cs ) = hierarchy ! mbSrcParent
-    ( newPar_p, fromJust -> newPar_cs ) = hierarchy ! mbDstParent
+    ( oldPar_p, fromJust -> oldPar_cs ) = hierarchy Map.! mbSrcParent
+    ( newPar_p, fromJust -> newPar_cs ) = hierarchy Map.! mbDstParent
     ( oldParent', oldChildPos ) =
       ( ( oldPar_p, Just $ ( filter ( /= srcUniq ) ) oldPar_cs )
       , case elemIndex srcUniq oldPar_cs of
@@ -740,7 +733,7 @@ dragAndDropLayerUpdate srcUniq ( mbTgtUniq, dropAbove ) mbSrcParent mbDstParent 
                              if dropAbove
                              then bef ++ [ srcUniq ] ++ aft
                              else bef ++ take 1 aft ++ [ srcUniq ] ++ drop 1 aft
-               ), fromIntegral $ length ( takeWhile ( /= tgtUniq ) newPar_cs ) + ( if dropAbove then 0 else 1 ) )
+               ), fromIntegral $ length bef + ( if dropAbove then 0 else 1 ) )
 
     hierarchy'
         -- Add the item to its new parent.
@@ -769,9 +762,8 @@ dragAndDropListModelUpdate rootStore layersListModel ( srcIx, mbSrcParentPos, sr
   treeListRow <- GTK.unsafeCastTo GTK.TreeListRow =<< fmap fromJust ( GIO.listModelGetItem layersListModel srcIx )
   item <- GTK.unsafeCastTo LayerItem =<< fmap fromJust ( GTK.treeListRowGetItem treeListRow )
 
-  if ( mbSrcParentPos, srcChildIx ) < ( mbDstParentPos, dstChildIx )
-  then do { insertDst item; removeSrc }
-  else do { removeSrc     ; insertDst item }
+  removeSrc
+  insertDst item
 
   where
     removeSrc =
@@ -802,7 +794,7 @@ testContent =
   Content
     { layerHierarchy =
         Map.fromList
-          [ ( Nothing           , ( Nothing, Just [ Unique 1, Unique 2, Unique 11 ] ) )
+          [ ( Nothing           , ( Nothing, Just [ Unique 1, Unique 2, Unique 11, Unique 12, Unique 13 ] ) )
           , ( Just ( Unique 1  ), ( Nothing, Nothing ) )
           , ( Just ( Unique 2  ), ( Nothing, Just [ Unique 3, Unique 4, Unique 5, Unique 10 ] ) )
           , ( Just ( Unique 3  ), ( Just ( Unique 2 ), Nothing ) )
@@ -814,6 +806,8 @@ testContent =
           , ( Just ( Unique 9  ), ( Just ( Unique 5 ), Nothing ) )
           , ( Just ( Unique 10 ), ( Just ( Unique 2 ), Nothing ) )
           , ( Just ( Unique 11 ), ( Nothing, Nothing ) )
+          , ( Just ( Unique 12 ), ( Nothing, Nothing ) )
+          , ( Just ( Unique 13 ), ( Nothing, Nothing ) )
           ]
     }
 
@@ -835,6 +829,8 @@ testMeta = Meta
                     ,     ( Unique 9, "layer 1.3.4" )
                     ,   ( Unique 10, "layer 1.4" )
                     , ( Unique 11, "layer 2" )
+                    , ( Unique 12, "layer 3" )
+                    , ( Unique 13, "layer 4" )
                     ]
         , invisibles = Set.fromList [ Unique 4, Unique 7 ]
         }
