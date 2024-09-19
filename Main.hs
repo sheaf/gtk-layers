@@ -11,9 +11,6 @@ import Data.List
   ( elemIndex )
 import Data.Maybe
   ( catMaybes, fromMaybe, fromJust )
-import Data.Traversable
-  ( for )
-
 import Data.Word
   ( Word32, Word64 )
 import GHC.Stack
@@ -59,6 +56,7 @@ import qualified GI.Gtk as GTK
 
 -- stm
 import qualified Control.Concurrent.STM.TVar as STM
+import qualified Control.Concurrent.STM.TMVar as STM
 import qualified Control.Monad.STM as STM
 
 -- text
@@ -71,6 +69,227 @@ import qualified Paths_gtk_layers as Cabal
   ( getDataFileName )
 
 --------------------------------------------------------------------------------
+-- Main application --
+----------------------
+
+main :: IO ()
+main = do
+  setEnv "GDK_SCALE" "2"
+  --setEnv "GTK_DEBUG" "actions,tree,layout"
+  --setEnv "GDK_DEBUG" "misc,events,input,dnd"
+  application <- GTK.applicationNew ( Just "com.layers" ) [ ]
+  GIO.applicationRegister application ( Nothing @GIO.Cancellable )
+  void $ GIO.onApplicationActivate application ( runApplication application )
+  exitCode <- GIO.applicationRun application Nothing
+  GObject.objectUnref application
+  case exitCode of
+    0 -> exitSuccess
+    _ -> exitWith ( ExitFailure $ fromIntegral exitCode )
+
+runApplication :: GTK.Application -> IO ()
+runApplication application = do
+
+  window <- GTK.applicationWindowNew application
+  GTK.setWindowTitle window "Layers"
+  GTK.windowSetDefaultSize window 640 480
+
+  display     <- GTK.rootGetDisplay window
+  cssProvider <- GTK.cssProviderNew
+  themePath   <- Directory.canonicalizePath =<< Cabal.getDataFileName "theme.css"
+  GTK.cssProviderLoadFromPath cssProvider themePath
+  GTK.styleContextAddProviderForDisplay display cssProvider 1000
+
+  GTK.widgetAddCssClass window "gtk-layers"
+
+  contentBox <- GTK.boxNew GTK.OrientationHorizontal 100
+  layersScrolledWindow <- GTK.scrolledWindowNew
+  GTK.scrolledWindowSetPolicy layersScrolledWindow GTK.PolicyTypeNever GTK.PolicyTypeAutomatic
+
+  GTK.boxAppend contentBox layersScrolledWindow
+
+  internalLayersLabel <- GTK.labelNew ( Just $ uncurry prettyLayers $ present testInitialHistory )
+  GTK.boxAppend contentBox internalLayersLabel
+
+
+  uniqueTVar  <- STM.newTVarIO @Unique  testInitialUnique
+  historyTVar <- STM.newTVarIO @History testInitialHistory
+
+  ( rootStore, layers ) <- newLayersListModel historyTVar
+  layersView <- newLayerView layersScrolledWindow uniqueTVar historyTVar internalLayersLabel rootStore layers
+  GTK.listViewSetShowSeparators layersView False
+
+  GTK.scrolledWindowSetChild layersScrolledWindow ( Just layersView )
+
+  GTK.windowSetChild window ( Just contentBox )
+  GTK.widgetSetVisible layersView True
+  GTK.widgetSetVisible window True
+
+  -- TODO: implement an undo/redo feature and make it update the UI appropriately.
+
+  -- TODO: implement "new layer", "new group", "delete layer/group".
+
+  void $ GTK.onApplicationQueryEnd application $
+    GTK.applicationRemoveWindow application window
+
+--------------------------------------------------------------------------------
+-- Application and UI state --
+------------------------------
+
+--------------
+-- App data --
+--------------
+
+-- | A unique identifier; can be used for any kind of object.
+newtype Unique = Unique { unique :: Word64 }
+  deriving newtype ( Eq, Ord, Enum )
+instance Show Unique where { show ( Unique i ) = "%" ++ show i }
+
+-- | The layer hierarchy.
+--
+-- This representation allows easy modifications, e.g. to move an item around
+-- one simply needs to edit the map in two places, removing the item from its
+-- old parent and adding it to its new parent.
+--
+-- This representation is chosen over a recursive data structure such as:
+--
+-- > type LayerHierarchy = [ Layer ]
+-- > data Layer = Layer { .. } | Group { .., groupChildren :: LayerHierarchy }
+--
+-- as such a representation is more difficult to edit (in particular when
+-- deeply nested items are involved).
+type LayerHierarchy = Map ( Parent Unique ) ( Maybe [ Unique ] )
+  -- TODO: use IntMap
+
+-- | The application state, with history for undo/redo.
+data History
+  = History
+  { past    :: !( Seq ( Content, Diff ) )
+  , present :: !( Content, Meta )
+  , future  :: ![ ( Diff, Content ) ]
+  }
+
+-- | Main application content, subject to undo/redo.
+data Content =
+  Content
+    { layerHierarchy :: !LayerHierarchy
+    -- layerData :: !( Map Unique SomeData )
+    }
+  deriving stock Show
+
+-- | Auxilary metadata about the application, not subject to undo/redo.
+data Meta =
+  Meta
+    { names :: !( Map Unique Text )
+    , invisibles :: !( Set Unique )
+    }
+
+-- | A change in state that can be undone/redone.
+--
+-- This is used to keep the GTK state in sync when we move around the history.
+data Diff
+  -- | Move a layer or group.
+  = Move
+    { moveSrc :: !( FlatIndex, Child )
+    , moveDst :: !( FlatIndex, Child )
+    }
+  -- TODO
+  -- | New
+  -- | Delete
+
+-- | A parent of an item (layer or group).
+data Parent a
+  -- | The item is at the top level.
+  = Root
+  -- | The item is in this group.
+  | InGroup !a
+  deriving stock ( Show, Eq, Ord )
+
+-- | A global index in a flattened tree list.
+--
+-- Used to refer to elements in the GTK TreeListModel; which flattens out
+-- the whole hierarchy.
+newtype FlatIndex = FlatIndex { flatIndex :: Word32 }
+  deriving ( Eq, Ord )
+  deriving stock Show
+
+-- | The position of a child relative to a parent.
+data Child
+  = Child
+    { childParent :: !( Parent FlatIndex )
+        -- ^ The index of the parent in the TreeListModel.
+    , childIndexInParent :: !Word32
+        -- ^ The index of the child within the parent.
+    }
+  deriving stock ( Show, Eq, Ord )
+
+-----------------
+-- GTK UI data --
+-----------------
+
+-- | Data that gets passed during a drag-and-drop operation, describing
+-- various properties of the **source** of the drag-and-drop operation.
+data DND_Data =
+  DND_Data
+    { dnd_sourceUnique :: !Unique
+    , dnd_sourceParentUnique :: !( Parent Unique )
+    , dnd_sourceFlatIndex :: !FlatIndex
+    , dnd_sourceParentFlatIndex :: !( Parent FlatIndex )
+    }
+  deriving stock ( Show, Eq )
+
+-- | Look up the name and visibility of a layer from the metadata.
+layerNameAndVisible :: Meta -> Unique -> ( Text, Bool )
+layerNameAndVisible ( Meta { names, invisibles } ) unique =
+  ( names Map.! unique, unique `notElem` invisibles )
+
+-- | Display the layer hierarchy (for debugging purposes).
+prettyLayers :: Content -> Meta -> Text
+prettyLayers ( Content { layerHierarchy } ) meta =
+  Text.intercalate "\n" $
+    concatMap go ( fromMaybe [] $ layerHierarchy Map.! Root )
+    where
+      go :: Unique -> [ Text ]
+      go i =
+        let ( name, visible ) = layerNameAndVisible meta i
+        in
+          case layerHierarchy Map.! ( InGroup i ) of
+            Nothing ->
+              [ "- Layer { layerName = \"" <> name <> "\", layerVisible = " <> Text.pack ( show visible ) <> " } " ]
+            Just cs ->
+              [ "- Group { layerName = \"" <> name <> "\", layerVisible = " <> Text.pack ( show visible ) <> " }" ]
+              ++ concatMap ( map ( "  " <> ) . go ) cs
+
+-- | Custom GTK object used to hold layer data.
+--
+-- These are the items that will get stored in the ListModel used by GTK
+-- to store the layer hierarchy data.
+newtype LayerItem = LayerItem ( GTK.ManagedPtr LayerItem )
+
+instance GI.TypedObject LayerItem  where
+  glibType = GI.registerGType LayerItem
+
+instance GI.GObject LayerItem
+
+instance GI.HasParentTypes LayerItem
+type instance GI.ParentTypes LayerItem = '[ GObject.Object ]
+
+
+-- | Data associated to a 'LayerItem', for use in the GTK UI state.
+data LayerID
+  = GroupID { layerUnique :: !Unique }
+  | LayerID { layerUnique :: !Unique }
+
+instance GI.DerivedGObject LayerItem where
+  type GObjectParentType  LayerItem = GObject.Object
+  type GObjectPrivateData LayerItem = Maybe LayerID
+  objectTypeName = "ListStoreExample-LayerItem"
+  objectClassInit _ = return ()
+  objectInstanceInit _ _ = return Nothing
+  objectInterfaces = [ ]
+
+--------------------------------------------------------------------------------
+-- GTK TreeListModel --
+-----------------------
 
 -- | Create a new 'GTK.TreeListModel' from the given set of layers.
 newLayersListModel :: STM.TVar History -> IO ( GIO.ListStore, GTK.TreeListModel )
@@ -103,63 +322,72 @@ newLayersListModel historyTVar = do
     where
       createChildModel :: GObject.Object -> IO ( Maybe GIO.ListModel )
       createChildModel parent = do
-        ( _parentDepth, layerItem ) <- treeListRowLayerItem parent
-        mbData <- GI.gobjectGetPrivateData layerItem
-        case mbData of
-          Nothing -> error "createChildModel: LayerItem has no data"
-          Just dat ->
-            case dat of
-              LayerID  {} -> return Nothing
-              GroupID { layerUnique = groupUnique } -> do
-                ( Content { layerHierarchy }, _ ) <- present <$> STM.readTVarIO historyTVar
-                let children = fromMaybe [] $ layerHierarchy Map.! ( InGroup groupUnique )
-                -- NB: create a simple GIO.ListStore, not a nested GTK.TreeListModel,
-                -- as that would cause e.g. grand-children model to be created twice.
-                itemType <- GI.glibType @LayerItem
-                store <- GIO.listStoreNew itemType
-                for_ children $ \ childUniq -> do
-                  let mbChildChildren = layerHierarchy Map.! ( InGroup childUniq )
-                      childLayer = case mbChildChildren of
-                        Nothing -> LayerID { layerUnique = childUniq }
-                        Just {} -> GroupID { layerUnique = childUniq }
-                  item <- GI.unsafeCastTo LayerItem =<< GObject.objectNewv itemType []
-                  GI.gobjectSetPrivateData item ( Just childLayer )
-                  GIO.listStoreAppend store item
-                Just <$> GIO.toListModel store
+        dat <- getLayerData =<< GTK.unsafeCastTo LayerItem parent
+        case dat of
+          LayerID  {} -> return Nothing
+          GroupID { layerUnique = groupUnique } -> do
+            ( Content { layerHierarchy }, _ ) <- present <$> STM.readTVarIO historyTVar
+            let children = fromMaybe [] $ layerHierarchy Map.! ( InGroup groupUnique )
+            -- NB: create a simple GIO.ListStore, not a nested GTK.TreeListModel,
+            -- as that would cause e.g. grand-children model to be created twice.
+            itemType <- GI.glibType @LayerItem
+            store <- GIO.listStoreNew itemType
+            for_ children $ \ childUniq -> do
+              let mbChildChildren = layerHierarchy Map.! ( InGroup childUniq )
+                  childLayer = case mbChildChildren of
+                    Nothing -> LayerID { layerUnique = childUniq }
+                    Just {} -> GroupID { layerUnique = childUniq }
+              item <- GI.unsafeCastTo LayerItem =<< GObject.objectNewv itemType []
+              GI.gobjectSetPrivateData item ( Just childLayer )
+              GIO.listStoreAppend store item
+            Just <$> GIO.toListModel store
 
 -- | Gets the 'LayerItem' for a row in a 'GTK.TreeListModel'
 -- with @passthrough = False@.
-treeListItemLayerItem :: GTK.ListItem -> IO ( Int, LayerItem )
+treeListItemLayerItem :: GTK.ListItem -> IO LayerItem
 treeListItemLayerItem listItem = do
   mbListRow <- GTK.listItemGetItem listItem
   case mbListRow of
     Nothing -> error "treeListItemLayerItem: ListItem has no item"
-    Just listRow -> do
-      listRowItem <- treeListRowGetItem listRow
-      treeListRowLayerItem listRowItem
+    Just listRow ->
+      treeListRowLayerItem =<< GTK.unsafeCastTo GTK.TreeListRow listRow
 
--- | Helper function to get the item underlying a 'GTK.TreeListRow'.
-treeListRowGetItem :: GObject.Object -> IO GObject.Object
-treeListRowGetItem listRow = do
-  mbListRowItem <- GTK.treeListRowGetItem =<< GTK.unsafeCastTo GTK.TreeListRow listRow
+-- | Retrieve the 'LayerItem' underlying a 'GTK.TreeListRow'.
+treeListRowLayerItem :: GTK.TreeListRow -> IO LayerItem
+treeListRowLayerItem listRow = do
+  mbListRowItem <- GTK.treeListRowGetItem listRow
   case mbListRowItem of
-    Nothing   -> error "treeListRowGetItem: TreeListRow has no item"
-    Just item -> return item
+    Nothing   -> error "treeListRowLayerItem: TreeListRow has no item"
+    Just item -> GTK.unsafeCastTo LayerItem item
+      -- NB: if you made the mistake of passing a 'createChildModel' function
+      -- which recursively creates a TreeListModel, you would have to recurse
+      -- into the row using 'treeListRowGetItem' to eventually get at the
+      -- underlying data.
 
--- | Recurse through the item of a 'GTK.TreeListRow' to get the 'LayerItem'.
---
--- Returns the depth at which the item was found.
-treeListRowLayerItem :: GObject.Object -> IO ( Int, LayerItem )
-treeListRowLayerItem = go 0
-  where
-    go !depth listRowItem = do
-      mbLayerItem <- GTK.castTo LayerItem listRowItem
-      case mbLayerItem of
-        Nothing -> do
-          listRow' <- treeListRowGetItem listRowItem
-          go ( depth + 1 ) listRow'
-        Just layerItem ->
-          return ( depth, layerItem )
+-- | Class for objects which wrap a 'LayerItem'.
+class HasLayerData a where
+  -- | Get the layer data associated to a 'LayerItem' or object
+  -- containing a 'LayerItem'.
+  getLayerData :: HasCallStack => a -> IO LayerID
+instance HasLayerData LayerItem where
+
+  getLayerData item = do
+    mbDat <- GI.gobjectGetPrivateData item
+    case mbDat of
+      Nothing -> error "getLayerData: no private data"
+      Just dat -> return dat
+instance HasLayerData GTK.TreeListRow where
+  getLayerData row = do
+    parLayerItem <- treeListRowLayerItem row
+    getLayerData parLayerItem
+instance HasLayerData GTK.ListItem where
+  getLayerData listItem = do
+    layerItem <- treeListItemLayerItem listItem
+    getLayerData layerItem
+
+-----------------------
+-- GTK layer widgets --
+-----------------------
 
 -- | The generic widget used to display a list item.
 --
@@ -168,7 +396,7 @@ treeListRowLayerItem = go 0
 --  - ListItem
 --    - TreeExpander
 --      - ContentBox
---        - CheckBox
+--        - CheckButton
 --        - Label
 data LayerViewWidget =
   LayerViewWidget
@@ -257,18 +485,41 @@ getLayerViewWidget expander = do
                   , layerViewLabel = layerLabel
                   }
 
+------------------
+-- GTK ListView --
+------------------
+
 -- | Create a new 'GTK.ListView' that displays 'LayerItem's.
-newLayerView :: GTK.Box
+newLayerView :: GTK.IsWidget layerViewContainer
+             => layerViewContainer
              -> STM.TVar Unique
              -> STM.TVar History
              -> GTK.Label
              -> GIO.ListStore
              -> GTK.TreeListModel
              -> IO GTK.ListView
-newLayerView layersBox _uniqueTVar historyTVar layersContentDebugLabel rootStore layersListModel = do
+newLayerView layersContainer _uniqueTVar historyTVar layersContentDebugLabel rootStore layersListModel = do
+
+  -- This TMVar is used to ensure that the layer hierarchy data
+  -- is in sync between the application and the UI (GTK TreeListModel).
+  listModelUpToDateTMVar <- STM.newTMVarIO ()
+
   layersListFactory <- GTK.signalListItemFactoryNew
 
   -- Connect to "setup" signal to create generic widgets for viewing the tree.
+  --
+  -- We attach a collection of signals to each widget,
+  -- to handle e.g. drag-and-drop operations.
+  --
+  -- We attach the signals in the "setup" phase, because we don't want
+  -- to have to keep attaching/removing event controllers to the widgets
+  -- (in the "bind" and "unbind" stages).
+  --
+  -- However, in the "setup" phase, we don't yet know which underlying ListModel
+  -- item we are displaying (this is only set on "bind").
+  -- So: how can we set signal handlers in the "setup" phase? The answer is that
+  -- each signal handler will read the private data associated to the widget;
+  -- this data gets set when binding the widget to its ListModel item.
   _ <- GTK.onSignalListItemFactorySetup layersListFactory $ \ listItem0 -> do
 
         listItem <- GTK.unsafeCastTo GTK.ListItem listItem0
@@ -282,14 +533,17 @@ newLayerView layersBox _uniqueTVar historyTVar layersContentDebugLabel rootStore
           { layerViewLabel = label }
             <- getLayerViewWidget expander
 
+        -------------------
+        -- EditableLabel --
+        -------------------
+
         -- Connect a signal for editing the layer name.
         --
         -- NB: we don't use the 'onEditableChanged' signal, as that updates
         -- after every key stroke.
         void $ GI.after label ( GI.PropertyNotify #hasFocus ) $ \ _ -> do
           newText <- GTK.editableGetText label
-          ( _, layerItem ) <- treeListItemLayerItem listItem
-          dat <- getLayerData layerItem
+          dat <- getLayerData listItem
           History { present = ( newContent, newMetadata ) } <- STM.atomically $ do
             hist@History { present = ( layers, meta@( Meta { names } ) ) } <- STM.readTVar historyTVar
             let names' = case dat of { LayerID { layerUnique = u } -> Map.insert u newText names
@@ -298,16 +552,19 @@ newLayerView layersBox _uniqueTVar historyTVar layersContentDebugLabel rootStore
                 hist' = hist { present = ( layers, meta' ) }
             STM.writeTVar historyTVar hist'
             return hist'
-          let newDebugText = Text.intercalate "\n" $ prettyLayers newContent newMetadata
+          let newDebugText = prettyLayers newContent newMetadata
           GTK.labelSetText layersContentDebugLabel newDebugText
+
+        ----------------
+        -- DragSource --
+        ----------------
 
         -- Connect signals for starting a drag from this widget.
         dragSource <- GTK.dragSourceNew
         GTK.dragSourceSetActions dragSource [ GDK.DragActionCopy ]
 
         void $ GTK.onDragSourcePrepare dragSource $ \ _x _y -> do
-          ( _, layerItem ) <- treeListItemLayerItem listItem
-          dat <- getLayerData layerItem
+          dat <- getLayerData listItem
 
           mbTreeListRow <- traverse ( GTK.unsafeCastTo GTK.TreeListRow ) =<< GTK.listItemGetItem listItem
           treeListRow <- case mbTreeListRow of
@@ -316,11 +573,7 @@ newLayerView layersBox _uniqueTVar historyTVar layersContentDebugLabel rootStore
 
           srcPos <- FlatIndex <$> GTK.treeListRowGetPosition treeListRow
           mbSrcPar <- GTK.treeListRowGetParent treeListRow
-          mbSrcParUniq <- for mbSrcPar $ \ srcParRow -> do
-            -- TODO: factor out.
-            parLayerItem <- GTK.unsafeCastTo LayerItem =<< (fromJust <$> GTK.treeListRowGetItem srcParRow)
-            parDat <- getLayerData parLayerItem
-            return $ layerUnique parDat
+          mbSrcParUniq <- traverse ( fmap layerUnique . getLayerData ) mbSrcPar
           mbParSrcPos <- fmap FlatIndex <$> traverse GTK.treeListRowGetPosition mbSrcPar
 
           let dragSourceData =
@@ -331,7 +584,7 @@ newLayerView layersBox _uniqueTVar historyTVar layersContentDebugLabel rootStore
                   , dnd_sourceParentFlatIndex = maybe Root InGroup mbParSrcPos
                   }
           val <- GDK.contentProviderNewForValue =<< GIO.toGValue ( GI.HValue dragSourceData )
-          GTK.widgetAddCssClass layersBox "dragging-item"
+          GTK.widgetAddCssClass layersContainer "dragging-item"
           return $ Just val
         void $ GTK.onDragSourceDragBegin dragSource $ \ _drag -> do
 
@@ -346,14 +599,18 @@ newLayerView layersBox _uniqueTVar historyTVar layersContentDebugLabel rootStore
           GTK.widgetAddCssClass expander "dragged"
           -- TODO: add "dragged" class for all descendants as well.
         void $ GTK.onDragSourceDragCancel dragSource $ \ _drag _reason -> do
-          GTK.widgetRemoveCssClass layersBox "dragging-item"
+          GTK.widgetRemoveCssClass layersContainer "dragging-item"
           GTK.widgetRemoveCssClass expander "dragged"
           return True
               -- ^^^^ Important. Setting this to 'False' stops GDK
               -- from properly clearing the drag cursor.
         void $ GTK.onDragSourceDragEnd dragSource $ \ _drag _deleteData -> do
-          GTK.widgetRemoveCssClass layersBox "dragging-item"
+          GTK.widgetRemoveCssClass layersContainer "dragging-item"
           GTK.widgetRemoveCssClass expander "dragged"
+
+        ----------------
+        -- DropTarget --
+        ----------------
 
         -- Connect signals for receiving a drop on this widget.
         dropTarget <- GTK.dropTargetNew GI.gtypeHValue [ GDK.DragActionCopy ]
@@ -367,15 +624,13 @@ newLayerView layersBox _uniqueTVar historyTVar layersContentDebugLabel rootStore
                 GTK.widgetRemoveCssClass nextItem "drag-top"
         void $ GTK.onDropTargetAccept dropTarget $ \ _drop -> do
           return True
-          --( _, layerItem ) <- treeListItemLayerItem listItem
-          --dat <- getLayerData layerItem
+          --dat <- getLayerData listItem
           --case dat of
           --  GroupID {} -> return True
           --  LayerID {} -> return True
         void $ GTK.onDropTargetDrop dropTarget $ \ val _x y -> do
           dropTargetCleanup
-          ( _, layerItem ) <- treeListItemLayerItem listItem
-          dstLayer <- getLayerData layerItem
+          dstLayer <- getLayerData listItem
           let dropTgtUniq = layerUnique dstLayer
 
           GI.HValue
@@ -415,44 +670,41 @@ newLayerView layersBox _uniqueTVar historyTVar layersContentDebugLabel rootStore
               else do
                 mbDstPar <- GTK.treeListRowGetParent treeListRow
                 mbParPos <- fmap FlatIndex <$> traverse GTK.treeListRowGetPosition mbDstPar
-
-                mbDstParUniq <- for mbDstPar $ \ dstParRow -> do
-                  parLayerItem <- GTK.unsafeCastTo LayerItem =<< (fromJust <$> GTK.treeListRowGetItem dstParRow)
-                  parDat <- getLayerData parLayerItem
-                  return $ layerUnique parDat
-
+                mbDstParUniq <- traverse ( fmap layerUnique . getLayerData ) mbDstPar
                 return ( mbDstParUniq, dstPos, maybe Root InGroup mbParPos )
-
 
             ( History { present = ( newContent, newMetadata ) }, ( srcChildIx, dstChildIx ) )
               <- STM.atomically $ do
+                -- Ensure the GTK ListModel is up to date before continuing
+                -- (just a precaution).
+                STM.takeTMVar listModelUpToDateTMVar
                 History { past, present = ( content@Content { layerHierarchy = hierarchy }, meta ) } <- STM.readTVar historyTVar
                 let ( mbDstParent, mbDropTgtUniq )
                       | not droppedAbove && expanded
                       = ( InGroup dropTgtUniq, Nothing )
                       | otherwise
                       = ( maybe Root InGroup mbDstParUniq, Just dropTgtUniq )
-                let ( hierarchy', ( srcChildIx, dstChildIx ) ) = dragAndDropLayerUpdate dragSrcUniq ( mbDropTgtUniq, droppedAbove ) dragSrcParUniq mbDstParent hierarchy
+                let ( hierarchy', ( srcChildIx, dstChildIx ) ) =
+                      dragAndDropLayerUpdate
+                        ( dragSrcParUniq, dragSrcUniq )
+                        ( mbDstParent, mbDropTgtUniq, droppedAbove )
+                        hierarchy
                     content' = content { layerHierarchy = hierarchy' }
-                    hist' = History { past = past Seq.:|> ( content, LayerMove ( dragSrcIx, Child dragSrcParPos srcChildIx ) ( dragDstIx, Child dstParPos dstChildIx ) )
+                    diff = Move
+                           { moveSrc = ( dragSrcIx, Child dragSrcParPos srcChildIx )
+                           , moveDst = ( dragDstIx, Child dstParPos dstChildIx )
+                           }
+                    hist' = History { past = past Seq.:|> ( content, diff )
                                     , present = ( content', meta )
                                     , future = []
                                     }
                 STM.writeTVar historyTVar hist'
                 return ( hist', ( srcChildIx, dstChildIx ) )
-            -- TODO: probably need to take a lock here to avoid funny business?
-{-
-            putStrLn $ unlines
-              [ "dnd"
-              , "dragSrcUniq: " ++ show dragSrcUniq
-              , "dropTgtUniq: " ++ show dropTgtUniq
-              , "drop inside group: " ++ show ( expanded && not droppedAbove )
-              , "newContent: " ++ show newContent
-              ]
--}
+
             dragAndDropListModelUpdate rootStore layersListModel ( dragSrcIx, Child dragSrcParPos srcChildIx ) ( Child dstParPos dstChildIx )
-            let newDebugText = Text.intercalate "\n" $ prettyLayers newContent newMetadata
+            let newDebugText = prettyLayers newContent newMetadata
             GTK.labelSetText layersContentDebugLabel newDebugText
+            STM.atomically $ STM.writeTMVar listModelUpToDateTMVar ()
             return True
 
         void $ GTK.onDropTargetEnter dropTarget $ \ _x y -> do
@@ -504,9 +756,10 @@ newLayerView layersBox _uniqueTVar historyTVar layersContentDebugLabel rootStore
           , layerViewLabel       = layerLabel
           } <- getLayerViewWidget expander
 
-        ( _, layerItem ) <- treeListItemLayerItem listItem
-        dat <- getLayerData layerItem
-        ( _, meta ) <- present <$> STM.readTVarIO historyTVar
+        dat <- getLayerData listItem
+        ( _content, meta ) <- present <$> STM.readTVarIO historyTVar
+
+        -- All we do is set the name and visibility of this layer/group.
 
         let ( layerText, checkBoxStatusVisible ) =
               case dat of
@@ -537,6 +790,12 @@ newLayerView layersBox _uniqueTVar historyTVar layersContentDebugLabel rootStore
                     GTK.noSelectionNew ( Just lmCopy )
   GTK.listViewNew ( Just selectionModel ) ( Just layersListFactory )
 
+-- | Get the next item in the flattened tree, if any.
+-- Ignores any notion of parent/child.
+--
+-- This is used to style the "item below" the current drop target,
+-- to account for the fact that the item below is rendered on top of the item
+-- above it, which overdraws any shadow/glow extending downwards on the latter.
 getNextItem_maybe :: GTK.TreeExpander -> IO ( Maybe ( GTK.TreeExpander ) )
 getNextItem_maybe expander = do
   mbParent <- GTK.widgetGetParent expander
@@ -554,7 +813,10 @@ getNextItem_maybe expander = do
               nextItem <- GTK.unsafeCastTo GTK.TreeExpander nextItem0
               return $ Just nextItem
 
-isDescendentOf :: Unique -> GTK.ListItem -> IO Bool
+-- | Is this list item a descendent of the item with the given unique?
+isDescendentOf :: Unique -- ^ are we a descendent of this?
+               -> GTK.ListItem -- ^ item we are querying
+               -> IO Bool
 isDescendentOf u listItem = do
   mbListRow <- GTK.listItemGetItem listItem
   case mbListRow of
@@ -565,208 +827,35 @@ isDescendentOf u listItem = do
   where
     go :: GTK.TreeListRow -> IO Bool
     go listRow = do
-      mbItem <- GTK.treeListRowGetItem listRow
-      case mbItem of
-        Nothing -> error "isDescendentOf: TreeListRow has no item"
-        Just i -> do
-          l <- GTK.unsafeCastTo LayerItem i
-          mbDat <- GI.gobjectGetPrivateData l
-          case mbDat of
-            Nothing -> error "isDescendentOf: no private data"
-            Just dat ->
-              if layerUnique dat == u
-              then return True
-              else do
-                mbPar <- GTK.treeListRowGetParent listRow
-                case mbPar of
-                  Nothing -> return False
-                  Just par -> go par
-
---------------------------------------------------------------------------------
-
-main :: IO ()
-main = do
-  setEnv "GDK_SCALE" "2"
-  --setEnv "GTK_DEBUG" "actions,tree,layout"
-  --setEnv "GDK_DEBUG" "misc,events,input,dnd"
-  application <- GTK.applicationNew ( Just "com.layers" ) [ ]
-  GIO.applicationRegister application ( Nothing @GIO.Cancellable )
-  void $ GIO.onApplicationActivate application ( runApplication application )
-  exitCode <- GIO.applicationRun application Nothing
-  GObject.objectUnref application
-  case exitCode of
-    0 -> exitSuccess
-    _ -> exitWith ( ExitFailure $ fromIntegral exitCode )
-
-runApplication :: GTK.Application -> IO ()
-runApplication application = do
-
-  window <- GTK.applicationWindowNew application
-  GTK.setWindowTitle window "Layers"
-  GTK.windowSetDefaultSize window 1024 768
-
-  display     <- GTK.rootGetDisplay window
-  cssProvider <- GTK.cssProviderNew
-  themePath   <- Directory.canonicalizePath =<< Cabal.getDataFileName "theme.css"
-  GTK.cssProviderLoadFromPath cssProvider themePath
-  GTK.styleContextAddProviderForDisplay display cssProvider 1000
-
-  GTK.widgetAddCssClass window "gtk-layers"
-
-  contentBox <- GTK.boxNew GTK.OrientationHorizontal 100
-  layersBox  <- GTK.boxNew GTK.OrientationVertical 0
-  GTK.boxAppend contentBox layersBox
-
-  internalLayersLabel <- GTK.labelNew ( Just $ Text.intercalate "\n" $ uncurry prettyLayers $ present testInitialHistory )
-  GTK.boxAppend contentBox internalLayersLabel
-
-
-  uniqueTVar  <- STM.newTVarIO @Unique  testInitialUnique
-  historyTVar <- STM.newTVarIO @History testInitialHistory
-
-  ( rootStore, layers ) <- newLayersListModel historyTVar
-  layersView <- newLayerView layersBox uniqueTVar historyTVar internalLayersLabel rootStore layers
-  GTK.listViewSetShowSeparators layersView False
-
-  GTK.boxAppend layersBox layersView
-
-  GTK.windowSetChild window ( Just contentBox )
-  GTK.widgetSetVisible layersView True
-  GTK.widgetSetVisible window True
-
-  -- TODO: implement an undo/redo feature and make it update the UI appropriately.
-
-  -- TODO: implement "new layer", "new group", "delete layer/group".
-
-  void $ GTK.onApplicationQueryEnd application $
-    GTK.applicationRemoveWindow application window
-
---------------------------------------------------------------------------------
-
---------------
--- App data --
---------------
-
-newtype Unique = Unique { unique :: Word64 }
-  deriving newtype ( Eq, Ord, Enum )
-instance Show Unique where { show ( Unique i ) = "%" ++ show i }
-
-type LayerHierarchy = Map ( Parent Unique ) ( Maybe [ Unique ] )
-  -- TODO: use IntMap
-
-data Content =
-  Content
-    { layerHierarchy :: !LayerHierarchy
-    -- layerData :: !( Map Unique SomeData )
-    }
-  deriving stock Show
-
-data Meta =
-  Meta { names :: !( Map Unique Text )
-       , invisibles :: !( Set Unique )
-       }
-
-data Position
-  = Top
-  | TopOfGroup !Unique
-  -- | Below an item. For a group: below the whole group.
-  | Below !Unique
-
-data Parent a
-  = Root
-  | InGroup !a
-  deriving stock ( Show, Eq, Ord )
-
--- | A global index in a flattened tree list.
-newtype FlatIndex = FlatIndex { flatIndex :: Word32 }
-  deriving ( Eq, Ord )
-  deriving stock Show
-
-data Child
-  = Child { childParent :: !( Parent FlatIndex )
-          , childIndex  :: !Word32
-          }
-  deriving stock ( Show, Eq, Ord )
-
-data Diff
-  = LayerMove
-    { layerMoveSrc :: !( FlatIndex, Child )
-    , layerMoveDst :: !( FlatIndex, Child )
-    }
-
-data History
-  = History
-  { past    :: !( Seq ( Content, Diff ) )
-  , present :: !( Content, Meta )
-  , future  :: ![ ( Diff, Content ) ]
-  }
-
------------------
--- GTK UI data --
------------------
-
-data DND_Data =
-  DND_Data
-    { dnd_sourceUnique :: !Unique
-    , dnd_sourceParentUnique :: !( Parent Unique )
-    , dnd_sourceFlatIndex :: !FlatIndex
-    , dnd_sourceParentFlatIndex :: !( Parent FlatIndex )
-    }
-  deriving stock ( Show, Eq )
-
-data LayerID
-  = GroupID { layerUnique :: !Unique }
-  | LayerID { layerUnique :: !Unique }
-
-layerNameAndVisible :: Meta -> Unique -> ( Text, Bool )
-layerNameAndVisible ( Meta { names, invisibles } ) unique =
-  ( names Map.! unique, unique `notElem` invisibles )
-
-prettyLayers :: Content -> Meta -> [ Text ]
-prettyLayers ( Content { layerHierarchy } ) meta =
-  concatMap go ( fromMaybe [] $ layerHierarchy Map.! Root )
-    where
-      go :: Unique -> [ Text ]
-      go i =
-        let ( name, visible ) = layerNameAndVisible meta i
-        in
-          case layerHierarchy Map.! ( InGroup i ) of
-            Nothing ->
-              [ "- Layer { layerName = \"" <> name <> "\", layerVisible = " <> Text.pack ( show visible ) <> " } " ]
-            Just cs ->
-              [ "- Group { layerName = \"" <> name <> "\", layerVisible = " <> Text.pack ( show visible ) <> " }" ]
-              ++ concatMap ( map ( "  " <> ) . go ) cs
-
-newtype LayerItem = LayerItem ( GTK.ManagedPtr LayerItem )
-
-instance GI.TypedObject LayerItem  where
-  glibType = GI.registerGType LayerItem
-
-instance GI.GObject LayerItem
-
-instance GI.HasParentTypes LayerItem
-type instance GI.ParentTypes LayerItem = '[ GObject.Object ]
-
-instance GI.DerivedGObject LayerItem where
-  type GObjectParentType  LayerItem = GObject.Object
-  type GObjectPrivateData LayerItem = Maybe LayerID
-  objectTypeName = "ListStoreExample-LayerItem"
-  objectClassInit _ = return ()
-  objectInstanceInit _ _ = return Nothing
-  objectInterfaces = [ ]
-
-getLayerData :: HasCallStack => LayerItem -> IO LayerID
-getLayerData item = do
-  mbDat <- GI.gobjectGetPrivateData item
-  case mbDat of
-    Nothing -> error "getPrivateData: no private data"
-    Just dat -> return dat
+      dat <- getLayerData listRow
+      if layerUnique dat == u
+      then return True
+      else do
+        mbPar <- GTK.treeListRowGetParent listRow
+        case mbPar of
+          Nothing -> return False
+          Just par -> go par
 
 --------------------------------------------------------------------------------
 -- Drag and drop update.
 
-dragAndDropLayerUpdate :: Unique -> ( Maybe Unique, Bool ) -> Parent Unique -> Parent Unique -> LayerHierarchy -> ( LayerHierarchy, ( Word32, Word32 ) )
-dragAndDropLayerUpdate srcUniq ( mbTgtUniq, dropAbove ) mbSrcParent mbDstParent hierarchy =
+-- | Update the 'LayerHierarchy' after a drag-and-drop operation.
+--
+-- This handles the application side logic.
+-- The UI side is handled in 'dragAndDropListModelUpdate'.
+--
+-- Returns an updated 'LayerHierarchy', together with the relative indices
+-- of the source and destination items within their respective parents.
+-- This information is then used by GTK to update the underlying 'ListModel'.
+dragAndDropLayerUpdate
+  :: ( Parent Unique, Unique )
+    -- ^ source
+  -> ( Parent Unique, Maybe Unique, Bool )
+    -- ^ destination (boolean: "dropped above")
+  -> LayerHierarchy
+    -- ^ hierarchy to update
+  -> ( LayerHierarchy, ( Word32, Word32 ) )
+dragAndDropLayerUpdate ( mbSrcParent, srcUniq ) ( mbDstParent, mbTgtUniq, dropAbove ) hierarchy =
 
   let
     ( fromJust -> oldPar_cs ) = hierarchy Map.! mbSrcParent
@@ -798,6 +887,10 @@ dragAndDropLayerUpdate srcUniq ( mbTgtUniq, dropAbove ) mbSrcParent mbDstParent 
   in
     ( hierarchy', ( oldChildPos, newChildPos ) )
 
+-- | Update the GTK ListModel backing the layer hierarchy after a drag-and-drop operation.
+--
+-- See also 'dragAndDropLayerUpdate', which updates the application state
+-- instead of the UI state.
 dragAndDropListModelUpdate :: GIO.ListStore -> GTK.TreeListModel -> ( FlatIndex, Child ) -> Child -> IO ()
 dragAndDropListModelUpdate rootStore layersListModel ( srcIx, src@( Child srcParentPos srcChildIx) ) dst@( Child dstParentPos dstChildIx ) = do
 
@@ -812,9 +905,8 @@ dragAndDropListModelUpdate rootStore layersListModel ( srcIx, src@( Child srcPar
     ]
 -}
 
-  treeListRow <- GTK.unsafeCastTo GTK.TreeListRow =<< fmap fromJust ( GIO.listModelGetItem layersListModel $ flatIndex srcIx )
-
-  item <- GTK.unsafeCastTo LayerItem =<< fmap fromJust ( GTK.treeListRowGetItem treeListRow )
+  treeListRow <- fromJust <$> GIO.listModelGetItem layersListModel ( flatIndex srcIx )
+  item <- treeListRowLayerItem =<< GTK.unsafeCastTo GTK.TreeListRow treeListRow
 
   if src < dst
   then do { insertDst item; removeSrc }
@@ -849,7 +941,9 @@ testContent =
   Content
     { layerHierarchy =
         Map.fromList
-          [ ( Root                 , Just [ Unique 1, Unique 2, Unique 11, Unique 12, Unique 13 ] )
+          -- NB: this should never be constructed by hand (too error-prone);
+          -- this is just for demonstration purposes.
+          [ ( Root                 , Just [ Unique 1, Unique 2, Unique 11, Unique 12, Unique 13, Unique 14 ] )
           , ( InGroup ( Unique 1  ), Nothing )
           , ( InGroup ( Unique 2  ), Just [ Unique 3, Unique 4, Unique 5, Unique 10 ] )
           , ( InGroup ( Unique 3  ), Nothing )
@@ -863,6 +957,11 @@ testContent =
           , ( InGroup ( Unique 11 ), Nothing )
           , ( InGroup ( Unique 12 ), Nothing )
           , ( InGroup ( Unique 13 ), Nothing )
+          , ( InGroup ( Unique 14 ), Just [ Unique 15, Unique 16, Unique 17 ] )
+          , ( InGroup ( Unique 15 ), Nothing )
+          , ( InGroup ( Unique 16 ), Nothing )
+          , ( InGroup ( Unique 17 ), Just [ Unique 18 ] )
+          , ( InGroup ( Unique 18 ), Nothing )
           ]
     }
 
@@ -879,18 +978,23 @@ testMeta :: Meta
 testMeta = Meta
         { names = Map.fromList
                     [ ( Unique 1, "layer 1" )
-                    , ( Unique 2, "group 1" )
-                    ,   ( Unique 3, "layer 1.1" )
-                    ,   ( Unique 4, "layer 1.2" )
-                    ,   ( Unique 5, "group 1.3" )
-                    ,     ( Unique 6, "layer 1.3.1" )
-                    ,     ( Unique 7, "layer 1.3.2" )
-                    ,     ( Unique 8, "group 1.3.3" )
-                    ,     ( Unique 9, "layer 1.3.4" )
-                    ,   ( Unique 10, "layer 1.4" )
-                    , ( Unique 11, "layer 2" )
-                    , ( Unique 12, "layer 3" )
-                    , ( Unique 13, "layer 4" )
+                    , ( Unique 2, "group 2" )
+                    ,   ( Unique 3, "layer 2.1" )
+                    ,   ( Unique 4, "layer 2.2" )
+                    ,   ( Unique 5, "group 2.3" )
+                    ,     ( Unique 6, "layer 2.3.1" )
+                    ,     ( Unique 7, "layer 2.3.2" )
+                    ,     ( Unique 8, "group 2.3.3" )
+                    ,     ( Unique 9, "layer 2.3.4" )
+                    ,   ( Unique 10, "layer 2.4" )
+                    , ( Unique 11, "layer 3" )
+                    , ( Unique 12, "layer 4" )
+                    , ( Unique 13, "layer 5" )
+                    , ( Unique 14, "group 6" )
+                    ,   ( Unique 15, "layer 6.1" )
+                    ,   ( Unique 16, "layer 6.2" )
+                    ,   ( Unique 17, "group 6.3" )
+                    ,     ( Unique 18, "layer 6.3.1" )
                     ]
         , invisibles = Set.fromList [ Unique 4, Unique 7 ]
         }
