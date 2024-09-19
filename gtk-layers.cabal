@@ -57,13 +57,16 @@ executable gtk-layers
   default-extensions:
       BangPatterns
       DataKinds
+      DeriveFunctor
       DerivingVia
+      GADTs
       GeneralizedNewtypeDeriving
       ImplicitParams
       LambdaCase
       LexicalNegation
       NamedFieldPuns
       OverloadedStrings
+      RecordWildCards
       TypeApplications
       TypeFamilies
       ViewPatterns
