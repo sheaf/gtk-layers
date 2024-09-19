@@ -92,7 +92,11 @@ newLayersListModel historyTVar = do
   let passthrough = False
       auto_expand = True
 
-  model <- GTK.treeListModelNew rootModel passthrough auto_expand createChildModel
+  -- Pass a copy of the (reference to the) root model to the
+  -- 'treeListModelNew' function to ensure we retain ownership of it.
+  model <- GI.withManagedPtr rootModel $ \ rmPtr ->
+           GI.withNewObject rmPtr $ \ rmCopy ->
+             GTK.treeListModelNew rmCopy passthrough auto_expand createChildModel
 
   return ( store, model )
 
@@ -526,7 +530,11 @@ newLayerView layersBox _uniqueTVar historyTVar layersContentDebugLabel rootStore
             GTK.checkButtonSetActive checkButton checkBoxStatusVisible
         GTK.editableSetText layerLabel layerText
 
-  selectionModel <- GTK.noSelectionNew ( Just layersListModel )
+  -- Pass a copy of the (reference to the) tree list model to the
+  -- selection model creation function to ensure we retain ownership of it.
+  selectionModel <- GI.withManagedPtr layersListModel $ \ lmPtr ->
+                    GI.withNewObject lmPtr $ \ lmCopy ->
+                    GTK.noSelectionNew ( Just lmCopy )
   GTK.listViewNew ( Just selectionModel ) ( Just layersListFactory )
 
 getNextItem_maybe :: GTK.TreeExpander -> IO ( Maybe ( GTK.TreeExpander ) )
