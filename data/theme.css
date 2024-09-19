@@ -5,8 +5,16 @@
 */
 
 row {
-  border: 0px;
-  margin: -2px;
+  border-top: 0px;
+  border-bottom: 0px;
+  margin-top: -2px;
+  margin-bottom: -2px;
+}
+
+/* Slightly hacky way to align layers and groups */
+indent {
+  margin-left: 4px;
+  margin-right: 4px;
 }
 
 .layer-item {

@@ -75,8 +75,8 @@ import qualified Paths_gtk_layers as Cabal
 main :: IO ()
 main = do
   setEnv "GDK_SCALE" "2"
-  --setEnv "GTK_DEBUG" "actions,tree,layout"
-  --setEnv "GDK_DEBUG" "misc,events,input,dnd"
+  setEnv "GTK_DEBUG" "actions"
+  setEnv "GDK_DEBUG" "dnd"
   application <- GTK.applicationNew ( Just "com.layers" ) [ ]
   GIO.applicationRegister application ( Nothing @GIO.Cancellable )
   void $ GIO.onApplicationActivate application ( runApplication application )
@@ -101,15 +101,16 @@ runApplication application = do
 
   GTK.widgetAddCssClass window "gtk-layers"
 
-  contentBox <- GTK.boxNew GTK.OrientationHorizontal 100
+  contentPane <- GTK.panedNew GTK.OrientationHorizontal
+  -- Set the paned handle to "wide", otherwise the handle can eat input around it.
+  GTK.panedSetWideHandle contentPane True
   layersScrolledWindow <- GTK.scrolledWindowNew
   GTK.scrolledWindowSetPolicy layersScrolledWindow GTK.PolicyTypeNever GTK.PolicyTypeAutomatic
 
-  GTK.boxAppend contentBox layersScrolledWindow
-
   internalLayersLabel <- GTK.labelNew ( Just $ uncurry prettyLayers $ present testInitialHistory )
-  GTK.boxAppend contentBox internalLayersLabel
 
+  GTK.panedSetStartChild contentPane ( Just internalLayersLabel )
+  GTK.panedSetEndChild   contentPane ( Just layersScrolledWindow )
 
   uniqueTVar  <- STM.newTVarIO @Unique  testInitialUnique
   historyTVar <- STM.newTVarIO @History testInitialHistory
@@ -120,7 +121,7 @@ runApplication application = do
 
   GTK.scrolledWindowSetChild layersScrolledWindow ( Just layersView )
 
-  GTK.windowSetChild window ( Just contentBox )
+  GTK.windowSetChild window ( Just contentPane )
   GTK.widgetSetVisible layersView True
   GTK.widgetSetVisible window True
 
@@ -282,7 +283,7 @@ data LayerID
 instance GI.DerivedGObject LayerItem where
   type GObjectParentType  LayerItem = GObject.Object
   type GObjectPrivateData LayerItem = Maybe LayerID
-  objectTypeName = "ListStoreExample-LayerItem"
+  objectTypeName = "gtk-layers-LayerItem"
   objectClassInit _ = return ()
   objectInstanceInit _ _ = return Nothing
   objectInterfaces = [ ]
