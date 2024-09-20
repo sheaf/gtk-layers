@@ -740,7 +740,8 @@ newLayerView uiElts@( UIElements { layersListModel, layersContainer, layersDebug
           dstPar <- getParentPosition treeListRow
           isDescendent <- isDescendentOf dragSrcUniq listItem
 
-          let dropIntoGroup = expanded && not droppedAbove
+          let dropIntoGroup
+                = expanded && not droppedAbove && not isDescendent
               mbDropOutsideGroup
                 | dragSrcUniq == dropTgtUniq
                 , Parent par <- dstPar
@@ -777,6 +778,7 @@ newLayerView uiElts@( UIElements { layersListModel, layersContainer, layersDebug
                         { itemUnique        = dropTgtUniq
                         , parentUnique      = dstParUniq
                         , grandParentUnique = fmap snd grandPar
+                        , itemExpanded      = expanded
                         }
                 | otherwise
                 -> do
@@ -1020,6 +1022,7 @@ data MoveDst
     { itemUnique        :: !Unique
     , parentUnique      :: !Unique
     , grandParentUnique :: !( Parent Unique )
+    , itemExpanded      :: !Bool
     }
   -- | Move an item above or below another item.
   | MoveAboveOrBelowPosition
@@ -1144,9 +1147,21 @@ applyChangeToLayerHierarchy change hierarchy =
                 { dstParUnique } ->
                   Just ( Parent dstParUnique, Nothing )
               MoveItemOutsideGroupIfLastItemInGroup
-                { itemUnique, parentUnique, grandParentUnique }
+                { itemUnique, parentUnique, grandParentUnique
+                , itemExpanded
+                }
                   | Just siblings <- hierarchy Map.! ( Parent parentUnique )
                   , last siblings == itemUnique
+                  -- Only allow this for a group when the group is not expanded
+                  -- or it has no children.
+                  , let expandedGroupWithChildren
+                          | itemExpanded
+                          , Just cs <- hierarchy Map.! ( Parent itemUnique )
+                          , not ( null cs )
+                          = True
+                          | otherwise
+                          = False
+                  , not expandedGroupWithChildren
                   -> Just ( grandParentUnique, Just ( parentUnique, False ) )
                   | otherwise
                   -> Nothing
