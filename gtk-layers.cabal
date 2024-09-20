@@ -64,6 +64,7 @@ executable gtk-layers
       ImplicitParams
       LambdaCase
       LexicalNegation
+      MultiWayIf
       NamedFieldPuns
       OverloadedStrings
       RecordWildCards
