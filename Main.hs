@@ -359,7 +359,7 @@ newLayersListModel historyTVar parStoreFromUniqTVar = do
   itemType <- GI.glibType @LayerItem
   store <- GIO.listStoreNew itemType
   STM.atomically $
-    STM.modifyTVar parStoreFromUniqTVar ( Map.insert Root store )
+    STM.modifyTVar' parStoreFromUniqTVar ( Map.insert Root store )
 
   ( Content { layerHierarchy }, _ ) <- present <$> STM.readTVarIO historyTVar
   let topLayers = fromMaybe [] $ layerHierarchy Map.! Root
@@ -398,8 +398,16 @@ newLayersListModel historyTVar parStoreFromUniqTVar = do
             itemType <- GI.glibType @LayerItem
 
             childStore <- GIO.listStoreNew itemType
-            STM.atomically $
-              STM.modifyTVar parStoreFromUniqTVar ( Map.insert ( Parent groupUnique ) childStore )
+            -- Store the child store in our mapping from parent unique to
+            -- ListStore, so that we know where to insert children.
+            mbOldChildStore <-
+              STM.atomically $
+                STM.stateTVar parStoreFromUniqTVar
+                  ( Map.insertLookupWithKey ( \ _k _old new -> new )
+                    ( Parent groupUnique ) childStore
+                  )
+            -- Free the old list store (never to be used again).
+            for_ mbOldChildStore GObject.objectUnref
             for_ children $ \ childUniq -> do
               let mbChildChildren = layerHierarchy Map.! Parent childUniq
                   childLayer = case mbChildChildren of
@@ -1007,7 +1015,7 @@ updateLayerHierarchy
         , future
         } ) <- STM.readTVar historyTVar
 
-      ( history', mbDiff ) <- case doOrUndo of
+      !( !history', mbDiff ) <- case doOrUndo of
         DoChange change -> do
           let !( !hierarchy', !newNames, mbDiff ) = applyChangeToLayerHierarchy change hierarchy
               !content' = presentContent { layerHierarchy = hierarchy' }
