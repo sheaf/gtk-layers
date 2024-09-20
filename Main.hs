@@ -80,7 +80,7 @@ main = do
   --setEnv "GSK_RENDERER" "gl"
   --setEnv "GTK_DEBUG" "" --"text,actions,geometry,tree,layout"
   --setEnv "GDK_DEBUG" "events" --"misc,events,frames,dnd"
-  --setEnv "GSK_DEBUG" "full-redraw" --"renderer,cache"
+  setEnv "GSK_DEBUG" "full-redraw" --"renderer,cache"
   application <- GTK.applicationNew ( Just "com.layers" ) [ ]
   GIO.applicationRegister application ( Nothing @GIO.Cancellable )
   void $ GIO.onApplicationActivate application ( runApplication application )
@@ -583,8 +583,31 @@ newLayerView uiElts@( UIElements { .. } ) variables@( Variables { .. } )  = do
         GTK.widgetAddCssClass expander "layer-item"
 
         LayerViewWidget
-          { layerViewLabel = label }
+          { layerViewLabel = label
+          , layerViewCheckButton = visibleButton }
             <- getLayerViewWidget expander
+
+        ----------------------------
+        -- Visibility CheckButton --
+        ----------------------------
+
+        void $ GTK.onCheckButtonToggled visibleButton $ do
+          dat <- getLayerData listItem
+          visible <- GTK.checkButtonGetActive ?self
+          let uniq = layerUnique dat
+          ( newContent, newMetadata ) <- STM.atomically $ do
+            hist@History { present = ( content, meta@( Meta { invisibles } ) ) } <- STM.readTVar historyTVar
+            let invisibles'
+                  | visible
+                  = Set.delete uniq invisibles
+                  | otherwise
+                  = Set.insert uniq invisibles
+                meta' = meta { invisibles = invisibles' }
+                hist' = hist { present = ( content, meta' ) }
+            STM.writeTVar historyTVar hist'
+            return ( content, meta' )
+          let newDebugText = prettyLayers newContent newMetadata
+          GTK.labelSetText layersDebugLabel newDebugText
 
         -------------------
         -- EditableLabel --
@@ -1247,7 +1270,7 @@ testContent :: Content
 testContent =
   Content
     { layerHierarchy =
-        Map.fromList
+        Map.fromList $
           -- NB: this should never be constructed by hand (too error-prone);
           -- this is just for demonstration purposes.
           [ ( Root                , Just [ Unique 1, Unique 2, Unique 11, Unique 12, Unique 13, Unique 14 ] )
