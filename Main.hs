@@ -684,7 +684,7 @@ newLayerView uiElts@( UIElements { layersListModel, layersContainer, layersDebug
 {- To set a cursor icon for the drag, write the x/y coordinates in the
    'prepare' signal handler to an IORef, and then use the following:
           ( x, y ) <- readIORef dragPosRef
-          paintable <- GDK.widgetPaintableNew ( Just expander )
+          paintable <- GTK.widgetPaintableNew ( Just expander )
           GTK.dragSourceSetIcon ?self ( Just paintable ) ( round x ) ( round y )
 -}
           noPaintable <- GDK.paintableNewEmpty 0 0

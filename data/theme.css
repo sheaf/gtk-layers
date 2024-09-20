@@ -17,20 +17,34 @@ indent {
   margin-right: 4px;
 }
 
+:selected {
+  background-color: rgba(255,255,255,0);
+  font-weight: bold;
+  color: black;
+}
+
 .layer-item {
   background-color: rgb(200,220,250);
+  border: 0px solid rgb(200,220,250);
   transition:
-    border-color 0.3s ease-in-out,
-    background-color 0.05s ease-in,
-    background-color 0.1s ease-out,
-    box-shadow 0.4s ease-in,
-    box-shadow 0.2s ease-out;
+    border-color 0.8s ease-out,
+    border-color 0.5s ease-in,
+    background-color 0.5s ease-out,
+    background-color 0.3s ease-in,
+    box-shadow 0.5s ease-out,
+    box-shadow 0.2s ease-in;
+
   padding-top: 4px;
   padding-bottom: 4px;
   border-top: 1px solid rgba(0, 191, 255, 0);
   border-bottom: 1px solid rgba(0, 191, 255, 0);
   margin-top: -1px;
   margin-bottom: -1px;
+}
+
+:selected .layer-item {
+  background-color: rgb(126, 161, 213);
+  border: 0px solid rgb(126, 161, 213);
 }
 
 .cursor {
@@ -50,7 +64,7 @@ indent {
 
 /* Style when dragging over the top part of an item */
 .drag-top.layer-item {
-  border-top: 2px solid rgb(0, 191, 255);
+  border-top: 2px solid rgba(0, 191, 255, 0.4);
   margin-top: -2px;
   box-shadow:
     0 -1px 6px 1px rgba(94, 234, 255, 0.5),
@@ -67,7 +81,7 @@ indent {
 
 /* Style for item being dragged */
 .dragged.layer-item {
-  background-color: grey;
+  background-color: rgb(177, 193, 217);
   transition:
-    background-color 0.3s ease-in-out;
+    background-color 0.4s ease-in-out;
 }
