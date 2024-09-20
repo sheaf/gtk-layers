@@ -979,9 +979,20 @@ data Diff
       , diffNewData :: !LayerID
       }
   | DiffDelete
-     { diffDelSrc   :: !ChildPosition
-     , diffDelData  :: !LayerID
-     }
+      { diffDelSrc   :: !ChildPosition
+      , diffDelData  :: !LayerID
+      }
+  -- TODO: all 'Diff's store a 'ChildPosition', which currently stores a
+  -- GIO.ListStore.
+  --
+  -- I believe this is risky, as we could:
+  --  1. create a new group
+  --  2. add some items to the group
+  --  3. end up with positions that store the ListModel that was created for this new group
+  --  4. undo until we undo the "group creation"
+  --  5. do various things until the ListModel in (3) is garbage collected
+  --  6. redo until we try to put items back into the ListModel
+  --     which no longer exists... causing a crash.
 
 -- | Update the layer hierarchy, keeping both the application state and
 -- the GTK ListModel in sync.
