@@ -106,8 +106,15 @@ data Variables
   { uniqueTVar  :: !( STM.TVar Unique )
   , historyTVar :: !( STM.TVar History )
 
+    -- | This TVar allows us to look up which 'GIO.ListStore' is used
+    -- for the children of a given parent.
+    --
+    -- This allows us to know, given a parent and a child index,
+    -- how to insert/delete from the 'GTK.TreeListModel'.
+  , parStoreFromUniqTVar :: !( STM.TVar ( Map ( Parent Unique ) GIO.ListStore ) )
+
     -- | This TMVar is used to ensure that the layer hierarchy data
-    -- is in sync between the application and the UI (GTK TreeListModel).
+    -- is kept in-sync between the application and the UI's 'GTK.TreeListModel'.
   , listModelUpToDateTMVar :: !( STM.TMVar () )
   }
 
@@ -127,8 +134,9 @@ runApplication application = do
 
   uniqueTVar  <- STM.newTVarIO @Unique  testInitialUnique
   historyTVar <- STM.newTVarIO @History testInitialHistory
+  parStoreFromUniqTVar <- STM.newTVarIO Map.empty
   listModelUpToDateTMVar <- STM.newTMVarIO ()
-  let variables = Variables { uniqueTVar, historyTVar, listModelUpToDateTMVar }
+  let variables = Variables { uniqueTVar, historyTVar, parStoreFromUniqTVar, listModelUpToDateTMVar }
 
   contentPane <- GTK.panedNew GTK.OrientationHorizontal
   -- Set the paned handle to "wide", otherwise the handle can eat input around it.
@@ -163,7 +171,7 @@ runApplication application = do
   traverse_ ( \ button -> GTK.widgetSetSensitive button False )
     [ undoButton, redoButton ]
 
-  ( layersRootStore, layersListModel ) <- newLayersListModel historyTVar
+  ( layersRootStore, layersListModel ) <- newLayersListModel historyTVar parStoreFromUniqTVar
 
   let uiElts =
         UIElements { layersContainer = layersScrolledWindow
@@ -179,16 +187,16 @@ runApplication application = do
 
   void $ GTK.onButtonClicked newLayerButton $ do
     u <- getUnique uniqueTVar
-    mbSelectedPos <- getSelectedPosition uiElts layersView
+    mbSelectedPos <- getSelectedPosition layersView
     let change = NewLayer { newUnique = u, newIsGroup = False, newSelected = mbSelectedPos }
     updateLayerHierarchy uiElts variables ( DoChange change )
   void $ GTK.onButtonClicked newGroupButton $ do
     u <- getUnique uniqueTVar
-    mbSelectedPos <- getSelectedPosition uiElts layersView
+    mbSelectedPos <- getSelectedPosition layersView
     let change = NewLayer { newUnique = u, newIsGroup = True, newSelected = mbSelectedPos }
     updateLayerHierarchy uiElts variables ( DoChange change )
   void $ GTK.onButtonClicked deleteLayerButton $ do
-    mbSelectedPos <- getSelectedPosition uiElts layersView
+    mbSelectedPos <- getSelectedPosition layersView
     case mbSelectedPos of
       Nothing ->
         -- TODO: the delete button should not be active if no item is selected.
@@ -274,23 +282,11 @@ data Parent a
   | Parent !a
   deriving stock ( Show, Eq, Ord, Functor )
 
--- | A global index in a flattened tree list.
---
--- Used to refer to elements in the GTK TreeListModel; which flattens out
--- the whole hierarchy.
---
--- These indices are ephemereal, as expanding/collapsing tree expanders can
--- cause these to change. Use 'getItemListStore' to turn these ephemereal
--- indices into something more stable.
-newtype EphemerealFlatIndex = EphemerealFlatIndex { ephemerealFlatIndex :: Word32 }
-  deriving ( Eq, Ord, Enum )
-  deriving stock Show
-
 -- | The position of a child relative to a parent.
 data ChildPosition
   = ChildPosition
-    { childParent :: !GIO.ListStore
-        -- ^ The parent list store for this item.
+    { childParent :: !( Parent Unique )
+        -- ^ The parent for this item.
     , childIndexInParent :: !Word32
         -- ^ The index of the child within the parent.
     }
@@ -356,10 +352,15 @@ instance GI.DerivedGObject LayerItem where
 -----------------------
 
 -- | Create a new 'GTK.TreeListModel' from the given set of layers.
-newLayersListModel :: STM.TVar History -> IO ( GIO.ListStore, GTK.TreeListModel )
-newLayersListModel historyTVar = do
+newLayersListModel :: STM.TVar History
+                   -> STM.TVar ( Map ( Parent Unique ) GIO.ListStore )
+                   -> IO ( GIO.ListStore, GTK.TreeListModel )
+newLayersListModel historyTVar parStoreFromUniqTVar = do
   itemType <- GI.glibType @LayerItem
   store <- GIO.listStoreNew itemType
+  STM.atomically $
+    STM.modifyTVar parStoreFromUniqTVar ( Map.insert Root store )
+
   ( Content { layerHierarchy }, _ ) <- present <$> STM.readTVarIO historyTVar
   let topLayers = fromMaybe [] $ layerHierarchy Map.! Root
   for_ topLayers $ \ layerUniq -> do
@@ -395,7 +396,10 @@ newLayersListModel historyTVar = do
             -- NB: create a simple GIO.ListStore, not a nested GTK.TreeListModel,
             -- as that would cause e.g. grand-children model to be created twice.
             itemType <- GI.glibType @LayerItem
-            store <- GIO.listStoreNew itemType
+
+            childStore <- GIO.listStoreNew itemType
+            STM.atomically $
+              STM.modifyTVar parStoreFromUniqTVar ( Map.insert ( Parent groupUnique ) childStore )
             for_ children $ \ childUniq -> do
               let mbChildChildren = layerHierarchy Map.! Parent childUniq
                   childLayer = case mbChildChildren of
@@ -403,8 +407,15 @@ newLayersListModel historyTVar = do
                     Just {} -> GroupID { layerUnique = childUniq }
               item <- GI.unsafeCastTo LayerItem =<< GI.new LayerItem []
               GI.gobjectSetPrivateData item ( Just childLayer )
-              GIO.listStoreAppend store item
-            Just <$> GIO.toListModel store
+              GIO.listStoreAppend childStore item
+
+            -- Pass a copy of the (reference to the) child store
+            -- to ensure we retain ownership of it.
+            childModelCopy <- GI.withManagedPtr childStore $ \ childStorePtr ->
+                              GI.withNewObject childStorePtr $ \ childStoreCopy ->
+                              GIO.toListModel childStoreCopy
+
+            return $ Just childModelCopy
 
 -- | Gets the 'LayerItem' for a row in a 'GTK.TreeListModel'
 -- with @passthrough = False@.
@@ -646,11 +657,11 @@ newLayerView uiElts@( UIElements { .. } ) variables@( Variables { .. } )  = do
           treeListRow <- case mbTreeListRow of
               Nothing -> error "newLayerView ListItem onSetup: no TreeListRow"
               Just r -> return r
-          ( srcParPos, srcParStore ) <- getParentPosition uiElts treeListRow
+          srcParPos <- getParentPosition treeListRow
 
           let dnd_sourcePosition =
                 Position
-                  { parentPosition = ( srcParPos, srcParStore )
+                  { parentPosition = srcParPos
                   , position = dat
                   }
 
@@ -729,20 +740,18 @@ newLayerView uiElts@( UIElements { .. } ) variables@( Variables { .. } )  = do
             -- The destination parent is usually the parent of the drop target,
             -- but when dropping below an expanded group, it is the group itself.
 
-            dragTgtPosIx <- EphemerealFlatIndex <$> GTK.treeListRowGetPosition treeListRow
             dropDst <-
               if expanded && not droppedAbove
-              then do
-                dragTgtStore <- getItemListStore uiElts ( Parent dragTgtPosIx )
+              then
                 return $
-                     MoveToTopOfGroup ( layerUnique dropTgtID, dragTgtStore )
+                     MoveToTopOfGroup ( layerUnique dropTgtID )
               else do
-                ( dstPar, dstParStore ) <- getParentPosition uiElts treeListRow
+                dstPar <- getParentPosition treeListRow
                 return $
                   MoveAboveOrBelowPosition
                     { moveDstPosition =
                         Position
-                          { parentPosition = ( dstPar, dstParStore )
+                          { parentPosition = dstPar
                           , position = dropTgtID
                           }
                     , moveAbove = droppedAbove
@@ -886,23 +895,19 @@ isDescendentOf u listItem = do
           Just par -> go par
 
 -- | Retrieve the position of the parent of the current 'GTK.TreeListRow', if any.
-getParentPosition :: UIElements -> GTK.TreeListRow -> IO ( Parent Unique, GIO.ListStore )
-getParentPosition uiElts treeListRow = do
+getParentPosition :: GTK.TreeListRow -> IO ( Parent Unique )
+getParentPosition treeListRow = do
   mbPar <- GTK.treeListRowGetParent treeListRow
-  par <-
-    case mbPar of
-      Nothing ->
-        return Root
-      Just p -> do
-        parUniq <- layerUnique <$> getLayerData p
-        parPos <- EphemerealFlatIndex <$> GTK.treeListRowGetPosition p
-        return ( Parent ( parUniq, parPos ) )
-  parStore <- getItemListStore uiElts ( fmap snd par )
-  return ( fmap fst par, parStore )
+  case mbPar of
+    Nothing ->
+      return Root
+    Just p -> do
+      parUniq <- layerUnique <$> getLayerData p
+      return ( Parent parUniq )
 
 -- | Get the position of the selected item in the 'ListView', if any.
-getSelectedPosition :: UIElements -> GTK.ListView -> IO ( Maybe Position )
-getSelectedPosition uiElts layersView = do
+getSelectedPosition :: GTK.ListView -> IO ( Maybe Position )
+getSelectedPosition layersView = do
   mbSelectionModel <- GTK.listViewGetModel layersView
   case mbSelectionModel of
     Nothing -> error "getSelectedPosition: no SelectionModel"
@@ -917,10 +922,10 @@ getSelectedPosition uiElts layersView = do
           Just item0 -> do
             layer     <- GTK.unsafeCastTo LayerItem item0
             layerData <- getLayerData layer
-            ( parent, parentStore ) <- getParentPosition uiElts row
+            parent <- getParentPosition row
             return $
               Position
-                { parentPosition = ( parent, parentStore )
+                { parentPosition = parent
                 , position = layerData
                 }
 
@@ -939,18 +944,10 @@ data DoChange = DoChange !Change | RedoChange | UndoChange
 -- and in terms of its parent 'GIO.ListStore'.
 data Position =
   Position
-    { parentPosition :: !( Parent Unique, GIO.ListStore )
+    { parentPosition :: !( Parent Unique )
     , position       :: !LayerID
     }
   deriving stock Eq
-
--- | Destination of a move operation.
-data MoveDst
-  = MoveToTopOfGroup !( Unique, GIO.ListStore )
-  | MoveAboveOrBelowPosition
-    { moveDstPosition :: !Position
-    , moveAbove :: !Bool
-    }
 
 -- | Description of a change to the layer hierarchy.
 data Change
@@ -967,8 +964,16 @@ data Change
       { deletePosition :: !Position
       }
 
--- | Data needed to modify the 'GIO.ListModel' underlying the layer hierarchy
--- corresponding to a 'Change'.
+-- | Destination of a move operation.
+data MoveDst
+  = MoveToTopOfGroup !Unique
+  | MoveAboveOrBelowPosition
+    { moveDstPosition :: !Position
+    , moveAbove :: !Bool
+    }
+
+-- | Information needed to apply (or unapply) a 'Change' to the
+-- 'GTK.TreeListModel' underlying the layer hierarchy.
 data Diff
   = DiffMove
       { diffMoveSrc :: !ChildPosition
@@ -982,24 +987,13 @@ data Diff
       { diffDelSrc   :: !ChildPosition
       , diffDelData  :: !LayerID
       }
-  -- TODO: all 'Diff's store a 'ChildPosition', which currently stores a
-  -- GIO.ListStore.
-  --
-  -- I believe this is risky, as we could:
-  --  1. create a new group
-  --  2. add some items to the group
-  --  3. end up with positions that store the ListModel that was created for this new group
-  --  4. undo until we undo the "group creation"
-  --  5. do various things until the ListModel in (3) is garbage collected
-  --  6. redo until we try to put items back into the ListModel
-  --     which no longer exists... causing a crash.
 
 -- | Update the layer hierarchy, keeping both the application state and
 -- the GTK ListModel in sync.
 updateLayerHierarchy :: UIElements -> Variables -> DoChange -> IO ()
 updateLayerHierarchy
-  uiElts@( UIElements { .. } )
-  ( Variables { historyTVar, listModelUpToDateTMVar } )
+  ( UIElements { .. } )
+  ( Variables { historyTVar, parStoreFromUniqTVar, listModelUpToDateTMVar } )
   doOrUndo = do
     ( newHistory, mbDiff ) <- STM.atomically $ do
 
@@ -1015,7 +1009,7 @@ updateLayerHierarchy
 
       ( history', mbDiff ) <- case doOrUndo of
         DoChange change -> do
-          let !( !hierarchy', !newNames, diff ) = applyChangeToLayerHierarchy uiElts change hierarchy
+          let !( !hierarchy', !newNames, diff ) = applyChangeToLayerHierarchy change hierarchy
               !content' = presentContent { layerHierarchy = hierarchy' }
               !meta' = meta { names = newNames <> names }
               mkHistory' =
@@ -1051,7 +1045,7 @@ updateLayerHierarchy
       STM.writeTVar historyTVar history'
       return ( history', mbDiff )
 
-    for_ mbDiff applyDiffToListModel
+    for_ mbDiff ( applyDiffToListModel parStoreFromUniqTVar )
 
     let newDebugText = uncurry prettyLayers $ present newHistory
         noFuture = null $ future newHistory
@@ -1067,20 +1061,20 @@ updateLayerHierarchy
 -- | Apply a change to the application layer hierarchy.
 --
 -- The change to the GTK ListModel is done in 'applyDiffToListModel'.
-applyChangeToLayerHierarchy :: UIElements -> Change -> LayerHierarchy -> ( LayerHierarchy, Map Unique Text, Diff )
-applyChangeToLayerHierarchy ( UIElements { layersRootStore } ) change hierarchy =
+applyChangeToLayerHierarchy :: Change -> LayerHierarchy -> ( LayerHierarchy, Map Unique Text, Diff )
+applyChangeToLayerHierarchy change hierarchy =
   case change of
     Move
-      { moveSrc = Position ( srcParUniq, srcParStore ) srcPosID
+      { moveSrc = Position srcParUniq srcPosID
       , moveDst } ->
-      let ( dstParUniq, dstParStore, mbDstPosUniq ) =
+      let ( dstParUniq, mbDstPosUniq ) =
             case moveDst of
-              MoveToTopOfGroup ( dstParUniq_, dstParStore_ ) ->
-                ( Parent dstParUniq_, dstParStore_, Nothing )
+              MoveToTopOfGroup dstParUniq_ ->
+                ( Parent dstParUniq_, Nothing )
               MoveAboveOrBelowPosition
-                { moveDstPosition = Position ( parUniq, parStore ) tgtID
+                { moveDstPosition = Position parUniq tgtID
                 , moveAbove } ->
-                  ( parUniq, parStore, Just ( layerUnique tgtID, moveAbove ) )
+                  ( parUniq, Just ( layerUnique tgtID, moveAbove ) )
           !( !hierarchy', ( srcChildIx, dstChildIx ) ) =
             moveLayerUpdate
               ( srcParUniq, layerUnique srcPosID )
@@ -1089,12 +1083,12 @@ applyChangeToLayerHierarchy ( UIElements { layersRootStore } ) change hierarchy 
       in ( hierarchy'
          , Map.empty
          , DiffMove
-             ( ChildPosition srcParStore srcChildIx )
-             ( ChildPosition dstParStore dstChildIx )
+             ( ChildPosition srcParUniq srcChildIx )
+             ( ChildPosition dstParUniq dstChildIx )
          )
     NewLayer { newUnique = u, newIsGroup, newSelected } ->
-      let ( ( dstParUniq, dstParStore ), dstChildPos ) = case newSelected of
-            Nothing  -> ( ( Root, layersRootStore ), Nothing )
+      let ( dstParUniq, dstChildPos ) = case newSelected of
+            Nothing  -> ( Root, Nothing )
             Just ( Position { parentPosition = par, position = dstID } ) ->
               -- TODO: this means we always create a new layer **above** the
               -- selected item.
@@ -1105,11 +1099,11 @@ applyChangeToLayerHierarchy ( UIElements { layersRootStore } ) change hierarchy 
         ( hierarchy''
         , Map.singleton u ( if newIsGroup then "Group" else "Layer" )
         , DiffNew
-            { diffNewDst = ChildPosition dstParStore dstChildIx
+            { diffNewDst = ChildPosition dstParUniq dstChildIx
             , diffNewData = if newIsGroup then GroupID u else LayerID u
             }
         )
-    Delete { deletePosition = Position ( parUniq, parStore ) posID } ->
+    Delete { deletePosition = Position parUniq posID } ->
       let u = layerUnique posID
           !( !hierarchy', childIx ) = removeLayer hierarchy ( parUniq, u )
           !hierarchy'' = Map.delete ( Parent u ) hierarchy'
@@ -1117,18 +1111,33 @@ applyChangeToLayerHierarchy ( UIElements { layersRootStore } ) change hierarchy 
         ( hierarchy''
         , Map.empty
         , DiffDelete
-            { diffDelSrc  = ChildPosition parStore childIx
+            { diffDelSrc  = ChildPosition parUniq childIx
             , diffDelData = posID
             }
         )
 
--- | Apply a change to the GTK ListModel.
+-- | Apply a change to the 'GTK.TreeListModel' underlying the UI
+-- representation of the layer hierarchy.
 --
--- The change to the application layer hierarchy is done in 'applyChangeToLayerHierarchy'.
-applyDiffToListModel :: ( Do, Diff ) -> IO ()
-applyDiffToListModel ( doOrUndo, diff ) =
+-- The change to the application 'LayerHierarchy' is done beforehand,
+-- in 'applyChangeToLayerHierarchy'.
+applyDiffToListModel :: STM.TVar ( Map ( Parent Unique ) GIO.ListStore ) -> ( Do, Diff ) -> IO ()
+applyDiffToListModel parStoreFromUniqTVar ( doOrUndo, diff ) = do
+  -- All modifications to the GTK.TreeListModel are done by editing
+  -- an appropriate child GIO.ListModel.
+  --
+  -- We **do not** use the flattened indices returned by GTK.treeListRowGetPosition,
+  -- as those are ephemeral (they change when tree expanders are expanded or collapsed).
+  -- Instead, we keep track of a mapping
+  --
+  --   parent --> list store used to hold its children
+  --
+  -- and use that child list store to perform updates.
+  parStoreFromUniq <- STM.readTVarIO parStoreFromUniqTVar
   case diff of
-    DiffMove ( ChildPosition srcStore srcIx ) ( ChildPosition dstStore dstIx ) ->
+    DiffMove ( ChildPosition srcPar srcIx ) ( ChildPosition dstPar dstIx ) -> do
+      let srcStore = parStoreFromUniq Map.! srcPar
+          dstStore = parStoreFromUniq Map.! dstPar
       case doOrUndo of
         Do -> do
           item <- fromJust <$> GIO.listModelGetItem srcStore srcIx
@@ -1138,7 +1147,8 @@ applyDiffToListModel ( doOrUndo, diff ) =
           item <- fromJust <$> GIO.listModelGetItem dstStore dstIx
           GIO.listStoreRemove dstStore dstIx
           GIO.listStoreInsert srcStore srcIx item
-    DiffNew { diffNewDst = ChildPosition dstStore dstIx, diffNewData } ->
+    DiffNew { diffNewDst = ChildPosition dstPar dstIx, diffNewData } -> do
+      let dstStore = parStoreFromUniq Map.! dstPar
       case doOrUndo of
         Do -> do
           item <- GI.new LayerItem []
@@ -1146,7 +1156,8 @@ applyDiffToListModel ( doOrUndo, diff ) =
           GIO.listStoreInsert dstStore dstIx item
         Undo ->
           GIO.listStoreRemove dstStore dstIx
-    DiffDelete { diffDelSrc = ChildPosition srcStore srcIx, diffDelData } ->
+    DiffDelete { diffDelSrc = ChildPosition srcPar srcIx, diffDelData } -> do
+      let srcStore = parStoreFromUniq Map.! srcPar
       case doOrUndo of
         Do -> GIO.listStoreRemove srcStore srcIx
         Undo -> do
@@ -1231,19 +1242,6 @@ insertLayer hierarchy ( par, mbTgtUniq ) srcUniq =
               )
   in ( Map.insert par parent' hierarchy, newChildPos )
 
--- | Retrieve the 'GIO.ListStore' associated with a parent at the given
--- 'EphemerealFlatIndex'.
-getItemListStore :: UIElements -> Parent EphemerealFlatIndex -> IO GIO.ListStore
-getItemListStore ( UIElements { layersRootStore, layersListModel } ) parentPos =
-  case parentPos of
-    Root ->
-      return layersRootStore
-    Parent parentIx -> do
-      parentRow <- fromJust <$> GTK.treeListModelGetRow layersListModel ( ephemerealFlatIndex parentIx )
-      parentModel <- fromJust <$> GTK.treeListRowGetChildren parentRow
-      parentStore <- GTK.unsafeCastTo GIO.ListStore parentModel
-      return parentStore
-
 --------------------------------------------------------------------------------
 -- Sample data for illustration.
 
@@ -1254,10 +1252,6 @@ testContent =
         Map.fromList $
           -- NB: this should never be constructed by hand (too error-prone);
           -- this is just for demonstration purposes.
-            ( Root, Just [ Unique i | i <- [ 1 .. 5 ] ] )
-          : [ ( Parent ( Unique i ), Nothing ) | i <- [ 1 .. 5 ] ]
-
-{-
           [ ( Root                , Just [ Unique 1, Unique 2, Unique 11, Unique 12, Unique 13, Unique 14 ] )
           , ( Parent ( Unique 1  ), Nothing )
           , ( Parent ( Unique 2  ), Just [ Unique 3, Unique 4, Unique 5, Unique 10 ] )
@@ -1278,7 +1272,6 @@ testContent =
           , ( Parent ( Unique 17 ), Just [ Unique 18 ] )
           , ( Parent ( Unique 18 ), Nothing )
           ]
--}
     }
 
 testInitialUnique :: Unique
@@ -1293,8 +1286,6 @@ testInitialUnique
 testMeta :: Meta
 testMeta = Meta
         { names = Map.fromList
-                    [ ( Unique i, Text.pack $ "layer " ++ show i ) | i <- [ 1 .. 5 ] ]
-{-
                     [ ( Unique 1, "layer 1" )
                     , ( Unique 2, "group 2" )
                     ,   ( Unique 3, "layer 2.1" )
@@ -1314,7 +1305,6 @@ testMeta = Meta
                     ,   ( Unique 17, "group 6.3" )
                     ,     ( Unique 18, "layer 6.3.1" )
                     ]
--}
         , invisibles = Set.fromList [ Unique 4, Unique 7 ]
         }
 testInitialHistory :: History
