@@ -77,10 +77,10 @@ import qualified Paths_gtk_layers as Cabal
 main :: IO ()
 main = do
   setEnv "GDK_SCALE" "2"
-  --setEnv "GSK_RENDERER" "gl"
+  --setEnv "GSK_RENDERER" "cairo"
   --setEnv "GTK_DEBUG" "" --"text,actions,geometry,tree,layout"
   --setEnv "GDK_DEBUG" "events" --"misc,events,frames,dnd"
-  --setEnv "GSK_DEBUG" "full-redraw"
+  --setEnv "GDK_DEBUG" "events" --"misc,events,frames,dnd,opengl"
   application <- GTK.applicationNew ( Just "com.layers" ) [ ]
   GIO.applicationRegister application ( Nothing @GIO.Cancellable )
   void $ GIO.onApplicationActivate application ( runApplication application )
@@ -1009,16 +1009,26 @@ updateLayerHierarchy
 
       ( history', mbDiff ) <- case doOrUndo of
         DoChange change -> do
-          let !( !hierarchy', !newNames, diff ) = applyChangeToLayerHierarchy change hierarchy
+          let !( !hierarchy', !newNames, mbDiff ) = applyChangeToLayerHierarchy change hierarchy
               !content' = presentContent { layerHierarchy = hierarchy' }
               !meta' = meta { names = newNames <> names }
-              mkHistory' =
-                History
-                  { past = past Seq.:|> ( presentContent, diff )
-                  , present = ( content', meta' )
-                  , future = []
-                  }
-          return ( mkHistory', Just ( Do, diff ) )
+              !( !history', mbDoOrUndo ) =
+                case mbDiff of
+                  Nothing ->
+                    ( History
+                        { past = past
+                        , present = ( content', meta' )
+                        , future = future
+                        }
+                    , Nothing )
+                  Just diff ->
+                    ( History
+                        { past = past Seq.:|> ( presentContent, diff )
+                        , present = ( content', meta' )
+                        , future = []
+                        }
+                    , Just ( Do, diff ) )
+          return ( history', mbDoOrUndo )
         UndoChange -> case past of
           past' Seq.:|> ( present', diff ) -> do
             let !history' =
@@ -1061,7 +1071,7 @@ updateLayerHierarchy
 -- | Apply a change to the application layer hierarchy.
 --
 -- The change to the GTK ListModel is done in 'applyDiffToListModel'.
-applyChangeToLayerHierarchy :: Change -> LayerHierarchy -> ( LayerHierarchy, Map Unique Text, Diff )
+applyChangeToLayerHierarchy :: Change -> LayerHierarchy -> ( LayerHierarchy, Map Unique Text, Maybe Diff )
 applyChangeToLayerHierarchy change hierarchy =
   case change of
     Move
@@ -1075,16 +1085,20 @@ applyChangeToLayerHierarchy change hierarchy =
                 { moveDstPosition = Position parUniq tgtID
                 , moveAbove } ->
                   ( parUniq, Just ( layerUnique tgtID, moveAbove ) )
-          !( !hierarchy', ( srcChildIx, dstChildIx ) ) =
+          !( !hierarchy', mbChildIxs ) =
             moveLayerUpdate
               ( srcParUniq, layerUnique srcPosID )
               ( dstParUniq, mbDstPosUniq )
               hierarchy
       in ( hierarchy'
          , Map.empty
-         , DiffMove
-             ( ChildPosition srcParUniq srcChildIx )
-             ( ChildPosition dstParUniq dstChildIx )
+         , case mbChildIxs of
+            Just ( srcChildIx, dstChildIx ) ->
+              Just $
+                DiffMove
+                  ( ChildPosition srcParUniq srcChildIx )
+                  ( ChildPosition dstParUniq dstChildIx )
+            Nothing -> Nothing
          )
     NewLayer { newUnique = u, newIsGroup, newSelected } ->
       let ( dstParUniq, dstChildPos ) = case newSelected of
@@ -1098,10 +1112,11 @@ applyChangeToLayerHierarchy change hierarchy =
       in
         ( hierarchy''
         , Map.singleton u ( if newIsGroup then "Group" else "Layer" )
-        , DiffNew
-            { diffNewDst = ChildPosition dstParUniq dstChildIx
-            , diffNewData = if newIsGroup then GroupID u else LayerID u
-            }
+        , Just $
+            DiffNew
+              { diffNewDst = ChildPosition dstParUniq dstChildIx
+              , diffNewData = if newIsGroup then GroupID u else LayerID u
+              }
         )
     Delete { deletePosition = Position parUniq posID } ->
       let u = layerUnique posID
@@ -1110,10 +1125,11 @@ applyChangeToLayerHierarchy change hierarchy =
       in
         ( hierarchy''
         , Map.empty
-        , DiffDelete
-            { diffDelSrc  = ChildPosition parUniq childIx
-            , diffDelData = posID
-            }
+        , Just $
+            DiffDelete
+              { diffDelSrc  = ChildPosition parUniq childIx
+              , diffDelData = posID
+              }
         )
 
 -- | Apply a change to the 'GTK.TreeListModel' underlying the UI
@@ -1184,15 +1200,21 @@ moveLayerUpdate
     --  - @Just (u, above)@ drop above/below u
   -> LayerHierarchy
     -- ^ hierarchy to update
-  -> ( LayerHierarchy, ( Word32, Word32 ) )
-moveLayerUpdate src@( _, srcUniq ) dst hierarchy =
+  -> ( LayerHierarchy, Maybe ( Word32, Word32 ) )
+moveLayerUpdate src@( srcPar, srcUniq ) dst@( dstPar, _ ) hierarchy =
   let
     -- Remove the child from its old parent.
     ( hierarchy' , oldChildPos ) = removeLayer hierarchy src
     -- Add the child to its new parent.
     ( hierarchy'', newChildPos ) = insertLayer hierarchy' dst srcUniq
   in
-    ( hierarchy'', ( oldChildPos, newChildPos ) )
+    ( hierarchy''
+      -- If the move is a no-op, then return 'Nothing' to avoid
+      -- updating the 'GTK.TreeListModel'.
+    , if srcPar == dstPar && oldChildPos == newChildPos
+      then Nothing
+      else Just ( oldChildPos, newChildPos )
+    )
 
 -- | Remove a layer or group from its parent in the 'LayerHierarchy',
 -- returning the updated 'LayerHierarchy' together with the index the item
