@@ -17,8 +17,8 @@ import Data.Word
   ( Word32, Word64 )
 import GHC.Stack
   ( HasCallStack )
-import System.Environment
-  ( setEnv )
+--import System.Environment
+--  ( setEnv )
 import System.Exit
   ( ExitCode(..), exitWith, exitSuccess )
 
@@ -76,11 +76,13 @@ import qualified Paths_gtk_layers as Cabal
 
 main :: IO ()
 main = do
-  setEnv "GDK_SCALE" "2"
-  --setEnv "GSK_RENDERER" "cairo"
-  --setEnv "GTK_DEBUG" "" --"text,actions,geometry,tree,layout"
-  --setEnv "GDK_DEBUG" "events" --"misc,events,frames,dnd"
-  --setEnv "GDK_DEBUG" "events" --"misc,events,frames,dnd,opengl"
+  -- Some useful environment variables:
+  --
+  --setEnv "GDK_SCALE"    "2"                 -- scale the UI up by a factor
+  --setEnv "GSK_RENDERER" "vulkan"            -- choose rendering backend
+  --setEnv "GTK_DEBUG"    "actions,layout"    -- GTK debug info
+  --setEnv "GDK_DEBUG"    "events,opengl,dnd" -- GDK debug info
+  --setEnv "GSK_DEBUG"    "full-redraw"       -- force redraws
   application <- GTK.applicationNew ( Just "com.layers" ) [ ]
   GIO.applicationRegister application ( Nothing @GIO.Cancellable )
   void $ GIO.onApplicationActivate application ( runApplication application )
@@ -93,18 +95,23 @@ main = do
 -- | UI elements that might need to be dynamically edited.
 data UIElements
   = UIElements
-  { layersContainer :: !GTK.ScrolledWindow
-  , layersDebugLabel :: !GTK.Label
+  { layersContainer        :: !GTK.ScrolledWindow
+      -- ^ Container for the layer hierarchy display.
+  , layersListModel        :: !GTK.TreeListModel
+      -- ^ The underlying 'GTK.TreeListModel' of the layer hierarchy.
+  , layersDebugLabel       :: !GTK.Label
+     -- ^ Label that displays the layer hierarchy textually.
   , undoButton, redoButton :: !GTK.Button
-  , layersListModel :: !GTK.TreeListModel
-  , layersRootStore :: !GIO.ListStore
+
   }
 
 -- | Global state of the application.
 data Variables
   = Variables
   { uniqueTVar  :: !( STM.TVar Unique )
+     -- ^ 'STM.TVar' used as an unique supply.
   , historyTVar :: !( STM.TVar History )
+     -- ^ The application state, enabling undo/redo.
 
     -- | This TVar allows us to look up which 'GIO.ListStore' is used
     -- for the children of a given parent.
@@ -171,14 +178,15 @@ runApplication application = do
   traverse_ ( \ button -> GTK.widgetSetSensitive button False )
     [ undoButton, redoButton ]
 
-  ( layersRootStore, layersListModel ) <- newLayersListModel historyTVar parStoreFromUniqTVar
+  layersListModel <- newLayersListModel historyTVar parStoreFromUniqTVar
 
   let uiElts =
-        UIElements { layersContainer = layersScrolledWindow
-                   , layersDebugLabel
-                   , undoButton, redoButton
-                   , layersListModel, layersRootStore
-                   }
+        UIElements
+          { layersContainer = layersScrolledWindow
+          , layersListModel
+          , layersDebugLabel
+          , undoButton, redoButton
+          }
 
   layersView <- newLayerView uiElts variables
   GTK.listViewSetShowSeparators layersView False
@@ -255,7 +263,7 @@ type LayerHierarchy = Map ( Parent Unique ) ( Maybe [ Unique ] )
 data History
   = History
   { past    :: !( Seq ( Content, Diff ) )
-  , present :: !( Content, Meta )
+  , present :: !( Content, Metadata )
   , future  :: ![ ( Diff, Content ) ]
   }
 
@@ -268,8 +276,8 @@ data Content =
   deriving stock Show
 
 -- | Auxilary metadata about the application, not subject to undo/redo.
-data Meta =
-  Meta
+data Metadata =
+  Metadata
     { names :: !( Map Unique Text )
     , invisibles :: !( Set Unique )
     }
@@ -297,12 +305,12 @@ data ChildPosition
 -----------------
 
 -- | Look up the name and visibility of a layer from the metadata.
-layerNameAndVisible :: Meta -> Unique -> ( Text, Bool )
-layerNameAndVisible ( Meta { names, invisibles } ) unique =
+layerNameAndVisible :: Metadata -> Unique -> ( Text, Bool )
+layerNameAndVisible ( Metadata { names, invisibles } ) unique =
   ( names Map.! unique, unique `notElem` invisibles )
 
 -- | Display the layer hierarchy (for debugging purposes).
-prettyLayers :: Content -> Meta -> Text
+prettyLayers :: Content -> Metadata -> Text
 prettyLayers ( Content { layerHierarchy } ) meta =
   Text.intercalate "\n" $
     concatMap go ( fromMaybe [] $ layerHierarchy Map.! Root )
@@ -354,7 +362,7 @@ instance GI.DerivedGObject LayerItem where
 -- | Create a new 'GTK.TreeListModel' from the given set of layers.
 newLayersListModel :: STM.TVar History
                    -> STM.TVar ( Map ( Parent Unique ) GIO.ListStore )
-                   -> IO ( GIO.ListStore, GTK.TreeListModel )
+                   -> IO GTK.TreeListModel
 newLayersListModel historyTVar parStoreFromUniqTVar = do
   itemType <- GI.glibType @LayerItem
   store <- GIO.listStoreNew itemType
@@ -376,13 +384,13 @@ newLayersListModel historyTVar parStoreFromUniqTVar = do
   let passthrough = False
       auto_expand = True
 
-  -- Pass a copy of the (reference to the) root model to the
+  -- Pass a copy of the (reference to the) root GIO.ListStore to the
   -- 'treeListModelNew' function to ensure we retain ownership of it.
   model <- GI.withManagedPtr rootModel $ \ rmPtr ->
            GI.withNewObject rmPtr $ \ rmCopy ->
              GTK.treeListModelNew rmCopy passthrough auto_expand createChildModel
 
-  return ( store, model )
+  return model
 
     where
       createChildModel :: GObject.Object -> IO ( Maybe GIO.ListModel )
@@ -574,7 +582,7 @@ getLayerViewWidget expander = do
 
 -- | Create a new 'GTK.ListView' that displays 'LayerItem's.
 newLayerView :: UIElements -> Variables -> IO GTK.ListView
-newLayerView uiElts@( UIElements { .. } ) variables@( Variables { .. } )  = do
+newLayerView uiElts@( UIElements { layersListModel, layersContainer, layersDebugLabel } ) variables@( Variables { .. } )  = do
 
   layersListFactory <- GTK.signalListItemFactoryNew
 
@@ -615,7 +623,7 @@ newLayerView uiElts@( UIElements { .. } ) variables@( Variables { .. } )  = do
           visible <- GTK.checkButtonGetActive ?self
           let uniq = layerUnique dat
           ( newContent, newMetadata ) <- STM.atomically $ do
-            hist@History { present = ( content, meta@( Meta { invisibles } ) ) } <- STM.readTVar historyTVar
+            hist@History { present = ( content, meta@( Metadata { invisibles } ) ) } <- STM.readTVar historyTVar
             let invisibles'
                   | visible
                   = Set.delete uniq invisibles
@@ -640,7 +648,7 @@ newLayerView uiElts@( UIElements { .. } ) variables@( Variables { .. } )  = do
           newText <- GTK.editableGetText label
           dat <- getLayerData listItem
           History { present = ( newContent, newMetadata ) } <- STM.atomically $ do
-            hist@History { present = ( layers, meta@( Meta { names } ) ) } <- STM.readTVar historyTVar
+            hist@History { present = ( layers, meta@( Metadata { names } ) ) } <- STM.readTVar historyTVar
             let names' = case dat of { LayerID { layerUnique = u } -> Map.insert u newText names
                                      ; GroupID { layerUnique = u } -> Map.insert u newText names }
                 meta' = meta { names = names' }
@@ -1011,7 +1019,7 @@ updateLayerHierarchy
 
       history@( History
         { past
-        , present = ( presentContent@Content { layerHierarchy = hierarchy }, meta@( Meta { names } ) )
+        , present = ( presentContent@Content { layerHierarchy = hierarchy }, meta@( Metadata { names } ) )
         , future
         } ) <- STM.readTVar historyTVar
 
@@ -1313,8 +1321,8 @@ testInitialUnique
   $ Map.keys
   $ layerHierarchy testContent
 
-testMeta :: Meta
-testMeta = Meta
+testMetadata :: Metadata
+testMetadata = Metadata
         { names = Map.fromList
                     [ ( Unique 1, "layer 1" )
                     , ( Unique 2, "group 2" )
@@ -1340,7 +1348,7 @@ testMeta = Meta
 testInitialHistory :: History
 testInitialHistory =
   History
-    { past = mempty
-    , present = ( testContent, testMeta )
-    , future = mempty
+    { past    = mempty
+    , present = ( testContent, testMetadata )
+    , future  = mempty
     }
