@@ -30,7 +30,8 @@ a layer system in GTK:
 
   - The GTK drag-and-drop API, which includes:
       - how to communicate Haskell data from the drag source to the drop target,
-      - full CSS styling to animate the drag and drop effect.
+      - full CSS styling to animate the drag and drop effect,
+      - updating the selection after a move operation.
 
   - Undo/redo functionality.
 

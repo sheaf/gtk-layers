@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedLabels #-}
+{-# LANGUAGE RecursiveDo #-}
 
 module Main where
 
@@ -589,7 +590,9 @@ getLayerViewWidget expander = do
 
 -- | Create a new 'GTK.ListView' that displays 'LayerItem's.
 newLayerView :: UIElements -> Variables -> IO GTK.ListView
-newLayerView uiElts@( UIElements { layersListModel, layersContainer, layersDebugLabel } ) variables@( Variables { .. } )  = do
+newLayerView
+  uiElts@( UIElements { layersListModel, layersContainer, layersDebugLabel } )
+  variables@( Variables { .. } ) = mdo
 
   layersListFactory <- GTK.signalListItemFactoryNew
 
@@ -681,6 +684,9 @@ newLayerView uiElts@( UIElements { layersListModel, layersContainer, layersDebug
               Just r -> return r
           srcParPos <- getParentPosition treeListRow
 
+          rowPos <- GTK.treeListRowGetPosition treeListRow
+          GTK.singleSelectionSetSelected selectionModel rowPos
+
           let dnd_sourcePosition =
                 Position
                   { parentPosition = fmap snd srcParPos
@@ -744,6 +750,7 @@ newLayerView uiElts@( UIElements { layersListModel, layersContainer, layersDebug
               Nothing -> error "newLayerView ListItem onSetup: no TreeListRow"
               Just r -> return r
 
+          dstFlatIndex <- GTK.treeListRowGetPosition treeListRow
           h <- GTK.widgetGetHeight expander
           let droppedAbove = y < 0.5 * fromIntegral h
           expanded <- GTK.treeListRowGetExpanded treeListRow
@@ -751,8 +758,18 @@ newLayerView uiElts@( UIElements { layersListModel, layersContainer, layersDebug
           dstPar <- getParentPosition treeListRow
           isDescendent <- isDescendentOf dragSrcUniq listItem
 
-          let dropIntoGroup
-                = expanded && not droppedAbove && not isDescendent
+          mbSelItem <- GTK.singleSelectionGetSelectedItem selectionModel
+          mbSelIx <- for mbSelItem $ \ selItem -> do
+            selRow <- GTK.unsafeCastTo GTK.TreeListRow selItem
+            GTK.treeListRowGetPosition selRow
+
+          let mbDropIntoGroup
+                | expanded
+                , not droppedAbove
+                , not isDescendent
+                = Just treeListRow
+                | otherwise
+                = Nothing
               mbDropOutsideGroup
                 | dragSrcUniq == dropTgtUniq
                 , Parent par <- dstPar
@@ -774,34 +791,51 @@ newLayerView uiElts@( UIElements { layersListModel, layersContainer, layersDebug
             --  2. when an item is at the bottom of a group, dropping it on its
             --     lower half moves the item out of the group, so the
             --     destination parent is the grand-parent of the drop target.
-            dropDst <-
+            ( dropDst, newPosInTree ) <-
               if
                 -- (1)
-                | dropIntoGroup
-                -> return $
-                    MoveToTopOfGroup dropTgtUniq
+                | Just dstParRow <- mbDropIntoGroup
+                -> do
+                    dstParFlatIndex <- GTK.treeListRowGetPosition dstParRow
+                    return $
+                      ( MoveToTopOfGroup dropTgtUniq
+                      , dstParFlatIndex + 1
+                      )
                 -- (2)
                 | Just ( dstParRow, dstParUniq ) <- mbDropOutsideGroup
                 -> do
                     grandPar <- getParentPosition dstParRow
                     return $
-                      MoveItemOutsideGroupIfLastItemInGroup
-                        { itemUnique        = dropTgtUniq
-                        , parentUnique      = dstParUniq
-                        , grandParentUnique = fmap snd grandPar
-                        , itemExpanded      = expanded
-                        }
+                      ( MoveItemOutsideGroupIfLastItemInGroup
+                          { itemUnique        = dropTgtUniq
+                          , parentUnique      = dstParUniq
+                          , grandParentUnique = fmap snd grandPar
+                          , itemExpanded      = expanded
+                          }
+                      , dstFlatIndex + 1
+                      )
                 | otherwise
                 -> do
                   return $
-                    MoveAboveOrBelowPosition
-                      { moveDstPosition =
-                          Position
-                            { parentPosition = fmap snd dstPar
-                            , position = dropTgtUniq
-                            }
-                      , moveAbove = droppedAbove
-                      }
+                    ( MoveAboveOrBelowPosition
+                        { moveDstPosition =
+                            Position
+                              { parentPosition = fmap snd dstPar
+                              , position = dropTgtUniq
+                              }
+                        , moveAbove = droppedAbove
+                        }
+                    , if droppedAbove then dstFlatIndex else dstFlatIndex + 1
+                    )
+
+            mbNbDescendants <-
+              case mbSelIx of
+                Nothing -> return Nothing
+                Just selIx -> do
+                  mbSelRow <- GTK.treeListModelGetRow layersListModel selIx
+                  for mbSelRow $ \ selRow0 -> do
+                      selRow <- GTK.unsafeCastTo GTK.TreeListRow selRow0
+                      getNbExpandedDescendants layersListModel selRow
 
             updateLayerHierarchy uiElts variables $
               DoChange $
@@ -809,6 +843,22 @@ newLayerView uiElts@( UIElements { layersListModel, layersContainer, layersDebug
                   { moveSrc = dragSrcPos
                   , moveDst = dropDst
                   }
+
+            -- After moving, update the selected item to be the moved item.
+            case mbSelIx of
+              Nothing -> return ()
+              Just selIx
+                -- If moving up, select the destination position.
+                | selIx >= newPosInTree
+                -> GTK.singleSelectionSetSelected selectionModel newPosInTree
+                | Just nbDescendants <- mbNbDescendants
+                -- If moving down, we need to account that the indices shift down
+                -- by the number of items we have moved.
+                , let newPosAfterShift = newPosInTree - nbDescendants
+                , newPosAfterShift >= 0
+                -> GTK.singleSelectionSetSelected selectionModel newPosAfterShift
+                | otherwise
+                -> return ()
             return True
 
         void $ GTK.onDropTargetEnter dropTarget $ \ _x y -> do
@@ -887,12 +937,15 @@ newLayerView uiElts@( UIElements { layersListModel, layersContainer, layersDebug
             GTK.checkButtonSetActive checkButton checkBoxStatusVisible
         GTK.editableSetText layerLabel layerText
 
-  -- Pass a copy of the (reference to the) tree list model to the
-  -- selection model creation function to ensure we retain ownership of it.
+  -- Pass copies of (references to) the TreeListModel and SelectionModel,
+  -- in order to retain ownership over them.
   selectionModel <- GI.withManagedPtr layersListModel $ \ lmPtr ->
                     GI.withNewObject lmPtr $ \ lmCopy ->
                     GTK.singleSelectionNew ( Just lmCopy )
-  GTK.listViewNew ( Just selectionModel ) ( Just layersListFactory )
+  listView <- GI.withManagedPtr selectionModel $ \ smPtr ->
+              GI.withNewObject smPtr $ \ smCopy ->
+              GTK.listViewNew ( Just smCopy ) ( Just layersListFactory )
+  return listView
 
 -- | Get the next item in the flattened tree, if any.
 -- Ignores any notion of parent/child.
@@ -939,6 +992,38 @@ isDescendentOf u listItem = do
         case mbPar of
           Nothing -> return False
           Just par -> go par
+
+getNbExpandedDescendants :: GTK.TreeListModel -> GTK.TreeListRow -> IO Word32
+getNbExpandedDescendants layersListModel = fmap fst . go
+  where
+    go :: GTK.TreeListRow -> IO ( Word32, Word32 )
+    go row0 = do
+      pos0 <- GTK.treeListRowGetPosition row0
+      expanded <- GTK.treeListRowGetExpanded row0
+      if not expanded
+      then do
+        return ( 1, pos0 )
+      else do
+        ( nbChildItems, lastPosChecked ) <- goChildren ( row0, pos0 )
+        return ( 1 + nbChildItems, lastPosChecked )
+    goChildren :: ( GTK.TreeListRow, Word32 ) -> IO ( Word32, Word32 )
+    goChildren ( row, lastPosChecked ) = do
+      mbRow' <- GTK.treeListModelGetRow layersListModel ( lastPosChecked + 1 )
+      case mbRow' of
+        Nothing -> do
+          return ( 0, lastPosChecked + 1 )
+        Just nextRow0 -> do
+          nextRow <- GTK.unsafeCastTo GTK.TreeListRow nextRow0
+          mbNextParent <- GTK.treeListRowGetParent nextRow
+          case mbNextParent of
+            Just nextParent
+              | nextParent == row
+              -> do
+                ( nbChildren, lastChecked ) <- go nextRow
+                ( n, lastChecked' ) <- goChildren ( row, lastChecked )
+                return ( nbChildren + n, lastChecked' )
+            _ -> return ( 0, lastPosChecked )
+
 
 -- | Retrieve the position of the parent of the current 'GTK.TreeListRow', if any.
 getParentPosition :: GTK.TreeListRow -> IO ( Parent ( GTK.TreeListRow, Unique ) )
@@ -1031,14 +1116,13 @@ data MoveDst
   -- but only if it is the last item in its parent.
   | MoveItemOutsideGroupIfLastItemInGroup
     { itemUnique        :: !Unique
+    , itemExpanded      :: !Bool
     , parentUnique      :: !Unique
     , grandParentUnique :: !( Parent Unique )
-    , itemExpanded      :: !Bool
     }
   -- | Move an item above or below another item.
   | MoveAboveOrBelowPosition
     { moveDstPosition :: !Position
-      -- ^ Where to move (parent and index within parent)
     , moveAbove :: !Bool
       -- ^ Whether to move above or below the destination.
     }
@@ -1152,14 +1236,18 @@ applyChangeToLayerHierarchy change hierarchy =
       let mbDst =
             case moveDst of
               MoveAboveOrBelowPosition
-                { moveAbove, moveDstPosition = Position parUniq tgtUniq } ->
-                  Just ( parUniq, Just ( tgtUniq, moveAbove ) )
+                { moveAbove
+                , moveDstPosition = Position parUniq tgtUniq
+                } ->
+                  Just ( parUniq
+                       , Just ( tgtUniq , moveAbove )
+                       )
               MoveToTopOfGroup
                 { dstParUnique } ->
                   Just ( Parent dstParUnique, Nothing )
               MoveItemOutsideGroupIfLastItemInGroup
-                { itemUnique, parentUnique, grandParentUnique
-                , itemExpanded
+                { itemUnique, itemExpanded
+                , parentUnique, grandParentUnique
                 }
                   | Just siblings <- hierarchy Map.! ( Parent parentUnique )
                   , last siblings == itemUnique
@@ -1238,7 +1326,9 @@ applyChangeToLayerHierarchy change hierarchy =
 --
 -- The change to the application 'LayerHierarchy' is done beforehand,
 -- in 'applyChangeToLayerHierarchy'.
-applyDiffToListModel :: STM.TVar ( Map ( Parent Unique ) GIO.ListStore ) -> ( Do, Diff ) -> IO ()
+applyDiffToListModel :: STM.TVar ( Map ( Parent Unique ) GIO.ListStore )
+                     -> ( Do, Diff )
+                     -> IO ()
 applyDiffToListModel parStoreFromUniqTVar ( doOrUndo, diff ) = do
   -- All modifications to the GTK.TreeListModel are done by editing
   -- an appropriate child GIO.ListModel.
