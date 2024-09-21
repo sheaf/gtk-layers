@@ -4,7 +4,7 @@ module Main where
 
 -- base
 import Control.Monad
-  ( unless, void )
+  ( unless, void, when )
 import Data.Foldable
   ( for_, traverse_ )
 import Data.List
@@ -78,8 +78,8 @@ main :: IO ()
 main = do
   -- Some useful environment variables:
   --
-  setEnv "GDK_SCALE"    "2"                 -- scale the UI up by a factor
-  --setEnv "GSK_RENDERER" "vulkan"            -- choose rendering backend
+  setEnv "GDK_SCALE"    "2"                   -- scale the UI up by a factor
+  --setEnv "GSK_RENDERER" "ngl"               -- choose rendering backend
   --setEnv "GTK_DEBUG"    "actions,layout"    -- GTK debug info
   --setEnv "GDK_DEBUG"    "events,opengl,dnd" -- GDK debug info
   --setEnv "GSK_DEBUG"    "full-redraw"       -- force redraws
@@ -178,7 +178,7 @@ runApplication application = do
   traverse_ ( \ button -> GTK.widgetSetSensitive button False )
     [ undoButton, redoButton ]
 
-  layersListModel <- newLayersListModel historyTVar parStoreFromUniqTVar
+  layersListModel <- newLayersListModel variables
 
   let uiElts =
         UIElements
@@ -351,10 +351,9 @@ instance GI.DerivedGObject LayerItem where
 -----------------------
 
 -- | Create a new 'GTK.TreeListModel' from the given set of layers.
-newLayersListModel :: STM.TVar History
-                   -> STM.TVar ( Map ( Parent Unique ) GIO.ListStore )
+newLayersListModel :: Variables
                    -> IO GTK.TreeListModel
-newLayersListModel historyTVar parStoreFromUniqTVar = do
+newLayersListModel ( Variables { .. } ) = do
   itemType <- GI.glibType @LayerItem
   store <- GIO.listStoreNew itemType
   STM.atomically $
@@ -392,38 +391,50 @@ newLayersListModel historyTVar parStoreFromUniqTVar = do
           GroupID { layerUnique = groupUnique } -> do
             ( Content { layerHierarchy }, _ ) <- present <$> STM.readTVarIO historyTVar
             let children = fromMaybe [] $ layerHierarchy Map.! Parent groupUnique
-            -- NB: create a simple GIO.ListStore, not a nested GTK.TreeListModel,
-            -- as that would cause e.g. grand-children models to be created twice.
-            itemType <- GI.glibType @LayerItem
 
-            childStore <- GIO.listStoreNew itemType
-            -- Store the child store in our mapping from parent unique to
-            -- ListStore, so that we know where to insert children.
-            _mbOldChildStore <-
-              STM.atomically $
-                STM.stateTVar parStoreFromUniqTVar
-                  ( Map.insertLookupWithKey ( \ _k _old new -> new )
-                    ( Parent groupUnique ) childStore
-                  )
-{- TODO: this causes crashes (e.g. when repeatedly expanding/collapsing a group).
-            for_ _mbOldChildStore $ \ oldChildStore ->
-              -- Free any outdated child store.
-              unless ( oldChildStore == childStore ) $
-                GObject.objectUnref oldChildStore
--}
+            -- Try to re-use an existing list store, if there is one.
+            mbOldChildStore <-
+              STM.atomically $ do
+                mbOldStore <-
+                  Map.lookup ( Parent groupUnique ) <$> STM.readTVar parStoreFromUniqTVar
+                when ( isNothing mbOldStore ) $
+                  -- Take a lock to avoid creating multiple child stores
+                  -- for the same group.
+                  STM.takeTMVar listModelUpToDateTMVar
+                return mbOldStore
 
-            for_ children $ \ childUniq -> do
-              let mbChildChildren = layerHierarchy Map.! Parent childUniq
-                  childLayer = case mbChildChildren of
-                    Nothing -> LayerID { layerUnique = childUniq }
-                    Just {} -> GroupID { layerUnique = childUniq }
-              item <- GI.unsafeCastTo LayerItem =<< GI.new LayerItem []
-              GI.gobjectSetPrivateData item ( Just childLayer )
-              GIO.listStoreAppend childStore item
+            newChildStore <-
+              case mbOldChildStore of
+                Just oldStore -> do
+                  return oldStore
+                Nothing -> do
+                  -- Otherwise, create a new child ListModel.
+                  -- NB: create a simple GIO.ListStore, not a nested GTK.TreeListModel,
+                  -- as that would cause e.g. grand-children models to be created twice.
+                  itemType <- GI.glibType @LayerItem
+                  childStore <- GIO.listStoreNew itemType
+
+                  for_ children $ \ childUniq -> do
+                    let mbChildChildren = layerHierarchy Map.! Parent childUniq
+                        childLayer = case mbChildChildren of
+                          Nothing -> LayerID { layerUnique = childUniq }
+                          Just {} -> GroupID { layerUnique = childUniq }
+                    item <- GI.unsafeCastTo LayerItem =<< GI.new LayerItem []
+                    GI.gobjectSetPrivateData item ( Just childLayer )
+                    GIO.listStoreAppend childStore item
+
+                  -- Store the child store in our mapping from parent unique to
+                  -- ListStore, so that we know where to insert children.
+                  STM.atomically $ do
+                    STM.modifyTVar parStoreFromUniqTVar
+                      ( Map.insert ( Parent groupUnique ) childStore )
+                    STM.putTMVar listModelUpToDateTMVar ()
+
+                  return childStore
 
             -- Pass a copy of the (reference to the) child store
             -- to ensure we retain ownership of it.
-            childModelCopy <- GI.withManagedPtr childStore $ \ childStorePtr ->
+            childModelCopy <- GI.withManagedPtr newChildStore $ \ childStorePtr ->
                               GI.withNewObject childStorePtr $ \ childStoreCopy ->
                               GIO.toListModel childStoreCopy
 
