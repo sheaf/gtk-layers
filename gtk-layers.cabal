@@ -37,7 +37,7 @@ executable gtk-layers
     , directory
     , haskell-gi-base
        >= 0.26.8
-       -- 0.28.8 adds the HValue API
+       -- 0.26.8 adds the HValue API
     , gi-gdk
        >= 4.0.9
        -- 4.0.9 fixes a bug with contentProviderNewForValue

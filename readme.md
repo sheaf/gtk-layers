@@ -23,7 +23,7 @@ a layer system in GTK:
     API), which separates the underlying model hierarchy from its visual display.  
     In particular, this shows:
       - how a `TreeListModel` can be edited by keeping references to underlying
-        child list stores:
+        child list stores;
       - how to set up the `ListView` that displays the model, including what
         to do in the `setup` and `bind` signal handlers of the `SignalListItemFactory`
         which is used to create widgets that visualise the underlying data.
@@ -41,7 +41,7 @@ the approach taken.
 ## Acknowledgements
 
 I extend my thanks to Iñaki García Etxebarria, the author and maintainer of the
-`haskell-gi` library, for patiently help me diagnose and fix bugs in early
-versions of this project.
+`haskell-gi` library, for his patient help with diagnosing and fixing bugs in
+early versions of this project.
 
 
