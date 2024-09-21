@@ -756,17 +756,12 @@ newLayerView
           expanded <- GTK.treeListRowGetExpanded treeListRow
 
           dstPar <- getParentPosition treeListRow
-          isDescendent <- isDescendentOf dragSrcUniq listItem
-
-          mbSelItem <- GTK.singleSelectionGetSelectedItem selectionModel
-          mbSelIx <- for mbSelItem $ \ selItem -> do
-            selRow <- GTK.unsafeCastTo GTK.TreeListRow selItem
-            GTK.treeListRowGetPosition selRow
+          isDescendant <- isDescendantOf dragSrcUniq listItem
 
           let mbDropIntoGroup
                 | expanded
                 , not droppedAbove
-                , not isDescendent
+                , not isDescendant
                 = Just treeListRow
                 | otherwise
                 = Nothing
@@ -778,7 +773,7 @@ newLayerView
                 | otherwise
                 = Nothing
 
-          if isDescendent && isNothing mbDropOutsideGroup
+          if isDescendant && isNothing mbDropOutsideGroup
           then do
             return False
           else do
@@ -828,14 +823,42 @@ newLayerView
                     , if droppedAbove then dstFlatIndex else dstFlatIndex + 1
                     )
 
-            mbNbDescendants <-
+            -- Compute the position that the item we are moving will have
+            -- at the end of the move.
+            --
+            -- First, we compute whether we moved up or down.
+            -- NB: we need to compute the source item position now (using 'treeListRowGetPosition'),
+            -- at the end of the drag-and-drop operation, because TreeExpander nodes
+            -- might have expanded/collapsed in the meantime.
+            mbSelItem <- GTK.singleSelectionGetSelectedItem selectionModel
+            mbSelIx <- for mbSelItem $ \ selItem -> do
+              selRow <- GTK.unsafeCastTo GTK.TreeListRow selItem
+              GTK.treeListRowGetPosition selRow
+
+            -- Now compute the final destination position.
+            mbDstPosAfterShift <-
               case mbSelIx of
-                Nothing -> return Nothing
-                Just selIx -> do
+                Nothing ->
+                  return Nothing
+                Just selIx
+                  -- If we moved up, simply use the destination position.
+                  | selIx >= newPosInTree
+                  -> return $ Just newPosInTree
+                  | otherwise
+                  -> do
+                  -- If we moved down, we need to substract the number of items
+                  -- moved. Note that this depends on which TreeExpander nodes
+                  -- are expanded.
                   mbSelRow <- GTK.treeListModelGetRow layersListModel selIx
-                  for mbSelRow $ \ selRow0 -> do
+                  case mbSelRow of
+                    Nothing -> return Nothing
+                    Just selRow0 -> do
                       selRow <- GTK.unsafeCastTo GTK.TreeListRow selRow0
-                      getNbExpandedDescendants layersListModel selRow
+                      nbDescendants <- getNbExpandedDescendants layersListModel selRow
+                      return $
+                        if newPosInTree < nbDescendants
+                        then Nothing
+                        else Just $ newPosInTree - nbDescendants
 
             updateLayerHierarchy uiElts variables $
               DoChange $
@@ -845,20 +868,10 @@ newLayerView
                   }
 
             -- After moving, update the selected item to be the moved item.
-            case mbSelIx of
+            case mbDstPosAfterShift of
               Nothing -> return ()
-              Just selIx
-                -- If moving up, select the destination position.
-                | selIx >= newPosInTree
-                -> GTK.singleSelectionSetSelected selectionModel newPosInTree
-                | Just nbDescendants <- mbNbDescendants
-                -- If moving down, we need to account that the indices shift down
-                -- by the number of items we have moved.
-                , let newPosAfterShift = newPosInTree - nbDescendants
-                , newPosAfterShift >= 0
-                -> GTK.singleSelectionSetSelected selectionModel newPosAfterShift
-                | otherwise
-                -> return ()
+              Just dstPos ->
+                GTK.singleSelectionSetSelected selectionModel dstPos
             return True
 
         void $ GTK.onDropTargetEnter dropTarget $ \ _x y -> do
@@ -970,14 +983,14 @@ getNextItem_maybe expander = do
               nextItem <- GTK.unsafeCastTo GTK.TreeExpander nextItem0
               return $ Just nextItem
 
--- | Is this list item a descendent of the item with the given unique?
-isDescendentOf :: Unique -- ^ are we a descendent of this?
+-- | Is this list item a descendant of the item with the given unique?
+isDescendantOf :: Unique -- ^ are we a descendant of this?
                -> GTK.ListItem -- ^ item we are querying
                -> IO Bool
-isDescendentOf u listItem = do
+isDescendantOf u listItem = do
   mbListRow <- GTK.listItemGetItem listItem
   case mbListRow of
-    Nothing -> error "isDescendentOf: ListItem has no item"
+    Nothing -> error "isDescendantOf: ListItem has no item"
     Just listRow0 -> do
       listRow <- GTK.unsafeCastTo GTK.TreeListRow listRow0
       go listRow
@@ -993,6 +1006,8 @@ isDescendentOf u listItem = do
           Nothing -> return False
           Just par -> go par
 
+-- | Get the number of expanded descendants of the given 'GTK.TreeListRow',
+-- including the row itself.
 getNbExpandedDescendants :: GTK.TreeListModel -> GTK.TreeListRow -> IO Word32
 getNbExpandedDescendants layersListModel = fmap fst . go
   where
